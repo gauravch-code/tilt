@@ -6,7 +6,9 @@ body { margin: 0; font: 22px/1.5 serif; background: #fff; color: #222 }
 p:nth-child(3n) { background: linear-gradient(90deg, #fde, #def) }
 </style></head><body><div id="counter"></div><div id="text"></div><script>
 // Scrolls `step` px per display refresh while `go` is set, and paints the frame number as 12
-// black/white blocks top left. `shown` lists [frame, wall-clock ms] for measure.mjs.
+// black/white blocks top left. `shown` lists [frame, wall-clock ms] for measure.mjs. With `hz`
+// set it scrolls that many times a second instead, for a browser whose animation frames are
+// not held to a display's refresh rate (measure.mjs, HZ).
 const blocks = [];
 for (let i = 0; i < 12; i++) blocks.push(document.getElementById('counter').appendChild(document.createElement('div')));
 let html = '';
@@ -14,10 +16,15 @@ for (let i = 0; i < 3000; i++) html += `<p>${i} Lorem ipsum dolor sit amet, cons
 document.getElementById('text').innerHTML = html;
 window.go = false;
 window.step = 12;
+window.hz = 0;
 window.shown = [];
 let n = 0;
-function tick() {
-  if (window.go) {
+let due = 0;
+function tick(now) {
+  const interval = window.hz ? 1000 / window.hz : 0;
+  if (window.go && now >= due) {
+    // On the grid, but never more than one step behind it.
+    due = Math.max(due + interval, now - interval);
     n++;
     scrollBy(0, window.step);
     window.shown.push([n, performance.timeOrigin + performance.now()]);

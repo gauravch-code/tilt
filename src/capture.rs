@@ -184,6 +184,7 @@ enum GrabKind {
 
 struct Capture {
     cfg: Arc<Config>,
+    /// The frame interval of the fastest viewer waiting for a frame (FrameHub::pace).
     fi: Duration,
     poll: Option<Duration>,
     /// The wait before the next safety poll: `poll`, backed off while polls find nothing.
@@ -235,7 +236,9 @@ impl Capture {
             self.idle = unwatched;
             let now = Instant::now();
             let mut due = None;
-            if self.hub.demand() {
+            if let Some(pace) = self.hub.pace() {
+                // Grab as often as the fastest viewer waiting can take a frame.
+                self.fi = pace;
                 let since_last = |gap| self.last_grab.map_or(now, |t| t + gap);
                 let next = match (self.damage_pending, self.poll) {
                     (true, _) => Some((GrabKind::Damage, self.paced_grab_at(now))),
@@ -621,6 +624,8 @@ mod tests {
     use crate::x11::testutil::{eventually, Xvfb};
 
     const WAIT: Duration = Duration::from_secs(5);
+    /// A 60 fps viewer's frame interval.
+    const FI: Duration = Duration::from_micros(16_667);
 
     /// A viewer that waits for the next frame, as a worker does.
     fn next_frame(hub: &FrameHub, rx: &Receiver<()>, sid: u64) -> u64 {
@@ -680,7 +685,7 @@ mod tests {
         let capture =
             spawn_capture(cfg, Arc::clone(&hub), wake, input, Arc::clone(&shutdown)).unwrap();
         let (tx, rx) = crossbeam_channel::bounded(1);
-        hub.subscribe(1, tx);
+        hub.subscribe(1, tx, FI);
         let (conn, screen) = connect(&x.display).unwrap();
         let mut reference = Grabber::new(&conn, screen).unwrap();
         let block = |x0, y0| Rectangle {
@@ -746,7 +751,7 @@ mod tests {
         let capture =
             spawn_capture(cfg, Arc::clone(&hub), wake, input, Arc::clone(&shutdown)).unwrap();
         let (tx, rx) = crossbeam_channel::bounded(1);
-        hub.subscribe(1, tx);
+        hub.subscribe(1, tx, FI);
 
         let (conn, screen) = connect(&x.display).unwrap();
         let root = conn.setup().roots[screen].root;
@@ -878,7 +883,7 @@ mod tests {
             spawn_capture(cfg, Arc::clone(&hub), wake, input, Arc::clone(&shutdown)).unwrap();
 
         let (tx, rx) = crossbeam_channel::bounded(1);
-        hub.subscribe(1, tx);
+        hub.subscribe(1, tx, FI);
         let first = next_frame(&hub, &rx, 1);
         // The screen changes while session 1 is connected but asks for nothing (between
         // frames, or out of credit): it keeps `latest`, the newest frame there is for it, but
@@ -904,7 +909,7 @@ mod tests {
             "a stale latest outlived the last session"
         );
         let (tx, rx) = crossbeam_channel::bounded(1);
-        hub.subscribe(2, tx);
+        hub.subscribe(2, tx, FI);
         let fresh = next_frame(&hub, &rx, 2);
         assert!(fresh > first);
 
@@ -916,7 +921,7 @@ mod tests {
             "a frame outlived the last session"
         );
         let (tx, rx) = crossbeam_channel::bounded(1);
-        hub.subscribe(3, tx);
+        hub.subscribe(3, tx, FI);
         let asked = Instant::now();
         assert!(next_frame(&hub, &rx, 3) > fresh);
         assert!(

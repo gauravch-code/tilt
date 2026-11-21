@@ -1526,6 +1526,7 @@ dependencies = [
  "mimalloc",
  "miniz_oxide",
  "openh264-sys2",
+ "quinn-proto",
  "ring",
  "serde",
  "serde_json",

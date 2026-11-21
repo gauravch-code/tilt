@@ -46,6 +46,17 @@ const LATE_MARGIN_MS = 3;
 const SMOOTH_MAX_HELD = 3;
 // An animation frame booked this long ago and still not run: draw without it.
 const RAF_LATE_MS = 100;
+// The display's refresh rate, from the times of animation frames: a frame is never early but
+// often late or skipped (a busy page, most of all while it loads), so the rate is the nearest
+// common one to the REFRESH_LOW share of the shortest intervals, of REFRESH_SAMPLES at most.
+// The hello waits REFRESH_WAIT_MS for the first REFRESH_FIRST of them; what the rest change
+// is told to the server afterwards.
+const REFRESH_SAMPLES = 60;
+const REFRESH_FIRST = 8;
+const REFRESH_LOW = 0.2;
+const REFRESH_RATES = [24, 30, 48, 50, 60, 72, 75, 90, 100, 120, 144, 165, 240];
+const REFRESH_WAIT_MS = 250;
+const REFRESH_BURST_MS = 2000;
 const CURSOR_CACHE = 64;
 // Chrome and Firefox ignore CSS cursor images larger than 128x128.
 const CSS_CURSOR_MAX = 128;
@@ -139,6 +150,8 @@ function readOptions() {
     scale: get('scale') === '1' ? '1' : 'fit',
     framing: get('framing') === 'avcc' ? 'avcc' : 'annexb',
     smooth: get('smooth') !== '0',
+    // fps=N: ask the server for N frames a second at most, whatever the display's refresh rate.
+    fps: /^[1-9]\d{0,2}$/.test(get('fps') ?? '') ? Math.min(240, Number(get('fps'))) : 0,
   };
 }
 
@@ -177,6 +190,10 @@ const stats = {
   framing: opts.framing,
   // Beyond the brief's list: the playout delay that smooths network jitter, in ms.
   smoothMs: 0,
+  // Beyond the brief's list: the display's refresh rate as measured, and the session's frame
+  // rate cap as the server has it (0 until its welcome says).
+  displayHz: opts.fps || 60,
+  fpsCap: 0,
 };
 const probeEvents = [];
 
@@ -234,6 +251,65 @@ const video = {
   idrTimer: 0,
   sizeNotice: false, // the server cannot encode the screen at its size (until its next KEY frame)
 };
+
+// The display: its refresh rate caps the session's frame rate (the server sends no more than
+// can be shown), and half its interval is how far ahead a refresh draws. `first` resolves
+// once a first estimate is in (or will not come: a hidden page gets no animation frames);
+// `told` is the rate this session's server has, 0 if it takes no corrections.
+const display = { hz: 60, interval: 1000 / 60, first: null, measuring: false, told: 0 };
+if (opts.fps) {
+  display.hz = opts.fps;
+  display.interval = 1000 / opts.fps;
+  display.first = Promise.resolve();
+}
+
+/** Measures the display's refresh rate over a burst of animation frames. */
+function measureDisplay() {
+  // `fps=` in the URL stands in for the measurement.
+  if (display.measuring || opts.fps) return;
+  display.measuring = true;
+  let active = true;
+  const gaps = [];
+  let last = 0;
+  let first;
+  display.first = new Promise((resolve) => { first = resolve; });
+  const estimate = () => {
+    if (gaps.length < REFRESH_FIRST) return;
+    const low = [...gaps].sort((a, b) => a - b)[Math.floor(gaps.length * REFRESH_LOW)];
+    const hz = REFRESH_RATES.reduce((best, r) => (Math.abs(1000 / r - low) < Math.abs(1000 / best - low) ? r : best));
+    display.hz = hz;
+    display.interval = 1000 / hz;
+    stats.displayHz = hz;
+  };
+  const done = () => {
+    if (!active) return;
+    active = false;
+    display.measuring = false;
+    estimate();
+    first();
+    sendFps();
+  };
+  setTimeout(first, REFRESH_WAIT_MS);
+  setTimeout(done, REFRESH_BURST_MS);
+  const frame = (t) => {
+    if (!active) return;
+    if (last && t > last) gaps.push(t - last);
+    last = t;
+    if (gaps.length === REFRESH_FIRST) {
+      estimate();
+      first();
+    }
+    if (gaps.length < REFRESH_SAMPLES) requestAnimationFrame(frame);
+    else done();
+  };
+  requestAnimationFrame(frame);
+}
+
+/** Tells the server the display's refresh rate if that is not what it has. */
+function sendFps() {
+  if (!display.told || display.told === display.hz) return;
+  if (sendJson({ t: 'fps', fps: display.hz })) display.told = display.hz;
+}
 
 const cursor = { shapes: new Map(), shape: null, pos: null };
 let lastPointer = finePointer.matches ? 'mouse' : 'touch';
@@ -301,9 +377,16 @@ function connect() {
   }
   const ws = new WtSocket(location.href);
   conn.ws = ws;
-  ws.onopen = () => {
-    if (ws !== conn.ws) return;
-    const hello = { t: 'hello', v: 1, recovery: true };
+  // Each connection measures the display again: a window moved to another one has another
+  // refresh rate. Only the first hello waits for it.
+  const measured = display.first;
+  measureDisplay();
+  ws.onopen = async () => {
+    await (measured ?? display.first);
+    if (ws !== conn.ws || ws.readyState !== 1) return;
+    display.told = 0;
+    const hello = { t: 'hello', v: 1, recovery: true, fps: display.hz };
+    if (ws.datagrams) hello.datagrams = 1;
     if (token) hello.token = token;
     hello.client = CLIENT;
     ws.send(JSON.stringify(hello));
@@ -444,6 +527,12 @@ function onWelcome(m) {
   stats.session = String(m.session ?? '');
   conn.server = String(m.server ?? '');
   stats.role = m.role === 'control' ? 'control' : 'view';
+  // The datagram lane: the server turns it on for a path where it pays.
+  if (m.datagrams === true && conn.ws.useLane) conn.ws.useLane();
+  // A server that names the session's frame rate cap takes corrections to it (`fps`).
+  display.told = Number.isInteger(m.fps) ? m.fps : 0;
+  stats.fpsCap = display.told;
+  sendFps();
   resize.allowed = m.resize === true;
   resize.sent = '';
   sendResize();
@@ -850,7 +939,7 @@ function refresh(frameTime) {
     bookRefresh();
     return;
   }
-  const until = smoothing ? frameTime + 8 : Infinity;
+  const until = smoothing ? frameTime + display.interval / 2 : Infinity;
   let ready = 0;
   while (ready < video.queue.length && video.queue[ready].done) ready++;
   let n = 0;
@@ -1539,6 +1628,10 @@ function postStats(now) {
       decoderStalls: stats.decoderStalls,
       recoveryFrames: conn.ws?.protected ?? 0,
       recoveredFrames: conn.ws?.recovered ?? 0,
+      datagrams: conn.ws?.lane === true,
+      fecFrames: conn.ws?.fecFrames ?? 0,
+      fecRepaired: conn.ws?.fecRepaired ?? 0,
+      displayHz: display.hz,
     },
     server: serverStats ? (({ t, ...rest }) => rest)(serverStats) : null,
   });

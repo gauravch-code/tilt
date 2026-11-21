@@ -66,8 +66,8 @@ pub struct Config {
     #[arg(long, env = "TILT_NO_AUTH", value_parser = BoolishValueParser::new())]
     pub no_auth: bool,
 
-    /// Frame rate cap per viewer (OpenH264 caps at 60)
-    #[arg(long, env = "TILT_MAX_FPS", default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=60))]
+    /// Frame rate cap per viewer; a viewer gets its display's refresh rate if that is lower
+    #[arg(long, env = "TILT_MAX_FPS", default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..=120))]
     pub max_fps: u32,
 
     /// Starting video bitrate
@@ -193,7 +193,7 @@ impl Config {
         !self.no_auth && self.token.is_none() && self.token_file.is_none()
     }
 
-    /// Minimum spacing between frames, 1 / max_fps.
+    /// Minimum spacing between frames at the cap, 1 / max_fps.
     pub fn frame_interval(&self) -> Duration {
         Duration::from_secs(1) / self.max_fps
     }
@@ -212,28 +212,30 @@ impl Config {
         }
     }
 
-    pub fn flow_config(&self) -> FlowConfig {
+    /// Flow control for a session whose frame rate cap is `fps`.
+    pub fn flow_config(&self, fps: u32) -> FlowConfig {
         FlowConfig {
-            fps: self.max_fps,
+            fps,
             start_bps: kbps_to_bps(self.bitrate_kbps),
             min_bps: kbps_to_bps(self.min_bitrate_kbps),
             max_bps: kbps_to_bps(self.max_bitrate_kbps),
         }
     }
 
-    /// Encoder settings for a `width`x`height` stream starting at `bitrate_bps`, in `profile`
-    /// (see [`Config::resolved_profile`]).
+    /// Encoder settings for a `width`x`height` stream of at most `fps` frames a second,
+    /// starting at `bitrate_bps`, in `profile` (see [`Config::resolved_profile`]).
     pub fn encoder_settings(
         &self,
         width: u32,
         height: u32,
+        fps: u32,
         bitrate_bps: u32,
         profile: Profile,
     ) -> EncoderSettings {
         EncoderSettings {
             width,
             height,
-            max_fps: self.max_fps as f32,
+            max_fps: fps as f32,
             bitrate_bps,
             min_qp: self.qp_min,
             max_qp: self.qp_max,
@@ -326,7 +328,7 @@ mod tests {
                 c.min_bitrate_kbps,
                 c.max_bitrate_kbps
             ),
-            (60, 8000, 1000, 20000)
+            (120, 8000, 1000, 20000)
         );
         assert_eq!((c.qp_min, c.qp_max, c.profile), (20, 28, Profile::High));
         assert_eq!((c.tail_frames, c.rc_frame_skip), (30, false));
@@ -400,9 +402,12 @@ mod tests {
             let c = parse(&["--no-auth", "--qp-min", "20", "--profile", p]).unwrap();
             assert_eq!(c.resolved_profile(1), c.profile, "{p} stays {p}");
         }
-        assert!(c.encoder_settings(64, 64, 1_000_000, Profile::High).cabac);
         assert!(
-            !c.encoder_settings(64, 64, 1_000_000, Profile::Baseline)
+            c.encoder_settings(64, 64, 60, 1_000_000, Profile::High)
+                .cabac
+        );
+        assert!(
+            !c.encoder_settings(64, 64, 60, 1_000_000, Profile::Baseline)
                 .cabac
         );
         // Auto may resolve to High, so it is held to High's QP floor.
@@ -420,7 +425,7 @@ mod tests {
     fn rejects_out_of_range_and_inconsistent_values() {
         for bad in [
             &["--max-fps", "0"][..],
-            &["--max-fps", "61"],
+            &["--max-fps", "121"],
             &["--qp-min", "0"],
             &["--qp-max", "52"],
             &["--qp-min", "30", "--qp-max", "28"],
@@ -504,7 +509,7 @@ mod tests {
         assert_eq!(c.frame_interval(), Duration::from_millis(20));
         assert_eq!(c.poll_interval(), Some(Duration::from_secs(1)));
         assert_eq!(
-            c.flow_config(),
+            c.flow_config(50),
             FlowConfig {
                 fps: 50,
                 start_bps: 8_000_000,
@@ -513,7 +518,7 @@ mod tests {
             }
         );
         assert_eq!(
-            c.encoder_settings(1024, 768, 5_000_000, c.profile),
+            c.encoder_settings(1024, 768, 50, 5_000_000, c.profile),
             EncoderSettings {
                 width: 1024,
                 height: 768,
@@ -526,7 +531,7 @@ mod tests {
             }
         );
         let c = parse(&["--token", "t", "--poll-ms", "0"]).unwrap();
-        assert!(c.encoder_settings(64, 64, 1_000_000, c.profile).cabac);
+        assert!(c.encoder_settings(64, 64, 60, 1_000_000, c.profile).cabac);
         assert_eq!(c.poll_interval(), None);
     }
 }

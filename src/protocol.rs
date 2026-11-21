@@ -22,6 +22,10 @@ pub const MSG_PONG: u8 = 0x04;
 // Client -> server binary message types.
 pub const MSG_ACK: u8 = 0x10;
 pub const MSG_PING: u8 = 0x11;
+/// Datagram only: which VIDEO seqs have arrived in full.
+pub const MSG_HAVE: u8 = 0x12;
+/// Datagram only: the newest input messages again, with their numbers.
+pub const MSG_INPUT: u8 = 0x13;
 pub const MSG_MOVE: u8 = 0x20;
 pub const MSG_BUTTON: u8 = 0x21;
 pub const MSG_WHEEL: u8 = 0x22;
@@ -307,6 +311,67 @@ impl ClientMsg {
     }
 }
 
+/// ACK and PING mean the same in any order, so they are not numbered among the control
+/// stream's messages (see `InputRun`).
+pub fn unordered(msg: &[u8]) -> bool {
+    matches!(msg.first(), Some(&(MSG_ACK | MSG_PING)))
+}
+
+/// A HAVE datagram, `u8 0x12 | u32 base | u64 bits`: every VIDEO seq before `base` has
+/// arrived in full, and so has `base + 1 + i` for each set bit `i`.
+pub fn parse_have(d: &[u8]) -> Option<(u32, u64)> {
+    (d.len() == 13 && d[0] == MSG_HAVE).then(|| {
+        (
+            u32_le(d, 1),
+            u64::from_le_bytes(d[5..13].try_into().expect("8 bytes")),
+        )
+    })
+}
+
+/// An INPUT datagram, `u8 0x13 | u32 first | { u8 len | message }…`: input messages
+/// (MOVE to CLIPBOARD) as they also go on the control stream, numbered `first`, `first + 1`
+/// and so on, a message's number being its place among the stream's messages other than ACK
+/// and PING, the hello being 1. Iterates as (number, message).
+pub struct InputRun<'a> {
+    number: u32,
+    rest: &'a [u8],
+}
+
+impl<'a> InputRun<'a> {
+    /// None unless every message in it is a whole input message.
+    pub fn parse(d: &'a [u8]) -> Option<InputRun<'a>> {
+        if d.len() < 5 || d[0] != MSG_INPUT {
+            return None;
+        }
+        let run = InputRun {
+            number: u32_le(d, 1),
+            rest: &d[5..],
+        };
+        let mut rest = run.rest;
+        while let Some((&len, tail)) = rest.split_first() {
+            let msg = tail.get(..usize::from(len))?;
+            if !matches!(msg.first(), Some(&(MSG_MOVE..=MSG_CLIPBOARD))) {
+                return None;
+            }
+            rest = &tail[usize::from(len)..];
+        }
+        Some(run)
+    }
+}
+
+impl<'a> Iterator for InputRun<'a> {
+    type Item = (u32, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (&len, tail) = self.rest.split_first()?;
+        let (msg, rest) = tail.split_at(usize::from(len));
+        let number = self.number;
+        self.number = number.wrapping_add(1);
+        self.rest = rest;
+        Some((number, msg))
+    }
+}
+
 // Callers check the length first.
 fn u16_le(p: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([p[at], p[at + 1]])
@@ -327,6 +392,12 @@ pub enum ClientText {
         client: Option<String>,
         #[serde(default)]
         recovery: bool,
+        /// 1: the client takes VIDEO as datagrams with parity and sends its own (the lane).
+        #[serde(default)]
+        datagrams: u8,
+        /// The viewer's display refresh rate, which caps the session's frame rate.
+        #[serde(default)]
+        fps: Option<u32>,
     },
     Control {
         take: bool,
@@ -339,6 +410,10 @@ pub enum ClientText {
     Resize {
         w: u32,
         h: u32,
+    },
+    /// The viewer's display refresh rate, when it turns out other than `hello` said.
+    Fps {
+        fps: u32,
     },
 }
 
@@ -354,6 +429,11 @@ pub enum ServerText {
         server: &'static str,
         /// Whether this session may send `resize` (`--resize`, control role).
         resize: bool,
+        /// The session's frame rate cap.
+        fps: u32,
+        /// The datagram lane is on for this session.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        datagrams: bool,
     },
     Control {
         you: bool,
@@ -405,7 +485,7 @@ pub struct Stats {
     pub inflight: u32,
     pub skipped: u64,
     pub viewers: u32,
-    /// The frame rate cap in force: `--max-fps`.
+    /// The frame rate cap in force: `--max-fps`, or the viewer's display if that is slower.
     pub gov_fps: u32,
     /// Mean quantizer of the frames in the window; 0 when there were none.
     pub qp: f32,
@@ -455,13 +535,15 @@ mod tests {
             screen: ScreenSize { w: 1920, h: 1080 },
             server: SERVER_ID,
             resize: true,
+            fps: 120,
+            datagrams: false,
         };
         assert_eq!(
             welcome.to_json(),
             concat!(
                 r#"{"t":"welcome","v":1,"session":"s7","role":"control","screen":{"w":1920,"h":1080},"server":"tilt/"#,
                 env!("CARGO_PKG_VERSION"),
-                r#"","resize":true}"#
+                r#"","resize":true,"fps":120}"#
             )
         );
         assert_eq!(
@@ -517,15 +599,57 @@ mod tests {
     }
 
     #[test]
+    fn lane_datagrams_parse() {
+        let mut have = vec![MSG_HAVE];
+        have.extend_from_slice(&7u32.to_le_bytes());
+        have.extend_from_slice(&0b101u64.to_le_bytes());
+        assert_eq!(parse_have(&have), Some((7, 0b101)));
+        assert_eq!(parse_have(&have[..12]), None);
+        assert_eq!(parse_have(&[MSG_ACK; 13]), None);
+
+        // KEY down and up for 'a', numbered 5 and 6.
+        let mut run = vec![MSG_INPUT];
+        run.extend_from_slice(&5u32.to_le_bytes());
+        for down in [1, 0] {
+            run.push(6);
+            run.extend_from_slice(&[MSG_KEY, down, 0x61, 0, 0, 0]);
+        }
+        let msgs: Vec<(u32, ClientMsg)> = InputRun::parse(&run)
+            .unwrap()
+            .map(|(n, m)| (n, ClientMsg::parse(m).unwrap()))
+            .collect();
+        let key = |down| ClientMsg::Key { down, keysym: 0x61 };
+        assert_eq!(msgs, [(5, key(true)), (6, key(false))]);
+        // No messages is a run of none.
+        assert_eq!(InputRun::parse(&run[..5]).unwrap().count(), 0);
+        // A message cut short, one that is not input, and an empty one are refused whole.
+        assert!(InputRun::parse(&run[..run.len() - 1]).is_none());
+        let mut ack = run.clone();
+        ack[6] = MSG_ACK;
+        assert!(InputRun::parse(&ack).is_none());
+        let mut empty = run.clone();
+        empty.push(0);
+        assert!(InputRun::parse(&empty).is_none());
+        assert!(InputRun::parse(&[MSG_INPUT, 0, 0]).is_none());
+        // ACK and PING are not numbered.
+        assert!(unordered(&[MSG_ACK]) && unordered(&[MSG_PING]));
+        assert!(!unordered(&[MSG_KEY]) && !unordered(&[]));
+    }
+
+    #[test]
     fn client_json_parses() {
         let parse = |s: &str| serde_json::from_str::<ClientText>(s).unwrap();
         assert_eq!(
-            parse(r#"{"t":"hello","v":1,"token":"tok","client":"tilt-web/0.1"}"#),
+            parse(
+                r#"{"t":"hello","v":1,"token":"tok","client":"tilt-web/0.1","datagrams":1,"fps":120}"#
+            ),
             ClientText::Hello {
                 v: 1,
                 token: Some("tok".into()),
                 client: Some("tilt-web/0.1".into()),
                 recovery: false,
+                datagrams: 1,
+                fps: Some(120),
             }
         );
         assert_eq!(
@@ -535,6 +659,8 @@ mod tests {
                 token: None,
                 client: None,
                 recovery: false,
+                datagrams: 0,
+                fps: None,
             }
         );
         assert_eq!(
@@ -542,6 +668,10 @@ mod tests {
             ClientText::Control { take: true }
         );
         assert_eq!(parse(r#"{"t":"idr"}"#), ClientText::Idr);
+        assert_eq!(
+            parse(r#"{"t":"fps","fps":120}"#),
+            ClientText::Fps { fps: 120 }
+        );
         assert_eq!(
             parse(r#"{"t":"video","on":false,"extra":1}"#),
             ClientText::Video { on: false }

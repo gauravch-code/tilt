@@ -36,6 +36,13 @@ thread_local! {
     static OPENH264_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+/// OpenH264 clips the frame rate it is told to this, and gives every frame the bitrate's
+/// share for one frame at that rate. Faster streams are told a bitrate lowered to match
+/// (`rate_control_bps`), so that their frames add up to the bitrate asked for.
+pub const RATE_CONTROL_MAX_FPS: f32 = 60.0;
+/// The highest frame rate the wrapper takes.
+pub const MAX_FPS: f32 = 120.0;
+
 /// The lowest QP that is safe with CABAC. OpenH264 sizes its bitstream buffer to the raw
 /// picture, and its CABAC writer never checks for room: full-swing noise overruns the buffer at
 /// QP 19 (seen under Guard Malloc) and needs about 96% of it at QP 20. The CAVLC writer checks
@@ -99,6 +106,11 @@ impl H264Encoder {
             settings: s.clone(),
         };
         encoder.initialize()?;
+        if s.max_fps > RATE_CONTROL_MAX_FPS {
+            // InitializeExt saw the whole bitrate, for the level it signals; rate control
+            // gets the share that makes frames at this rate add up to it.
+            encoder.set_bitrate(s.bitrate_bps)?;
+        }
         tracing::debug!(settings = ?s, "H.264 encoder ready");
         Ok(encoder)
     }
@@ -216,7 +228,8 @@ impl H264Encoder {
         );
         let mut info = SBitrateInfo {
             iLayer: SPATIAL_LAYER_ALL,
-            iBitrate: c_int::try_from(bps).unwrap_or(c_int::MAX),
+            iBitrate: c_int::try_from(rate_control_bps(bps, self.settings.max_fps))
+                .unwrap_or(c_int::MAX),
         };
         // SAFETY: ENCODER_OPTION_BITRATE takes an SBitrateInfo.
         unsafe { self.set_option(ENCODER_OPTION_BITRATE, &mut info) }?;
@@ -395,8 +408,8 @@ fn check(s: &EncoderSettings) -> anyhow::Result<()> {
         .into());
     }
     ensure!(
-        (1.0..=60.0).contains(&s.max_fps),
-        "max_fps {} is outside OpenH264's 1..=60",
+        (1.0..=MAX_FPS).contains(&s.max_fps),
+        "max_fps {} is outside 1..={MAX_FPS}",
         s.max_fps
     );
     ensure!(
@@ -419,6 +432,15 @@ fn check(s: &EncoderSettings) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The bitrate to give OpenH264 for frames at `max_fps` to add up to `bps`: OpenH264 budgets
+/// each frame as one of at most RATE_CONTROL_MAX_FPS a second.
+fn rate_control_bps(bps: u32, max_fps: f32) -> u32 {
+    if max_fps <= RATE_CONTROL_MAX_FPS {
+        return bps;
+    }
+    ((f64::from(bps) * f64::from(RATE_CONTROL_MAX_FPS) / f64::from(max_fps)) as u32).max(1)
+}
+
 /// Brief section 5.7 on top of OpenH264's defaults.
 fn fill_params(p: &mut SEncParamExt, s: &EncoderSettings) {
     // check() keeps both dims far below c_int::MAX.
@@ -428,7 +450,7 @@ fn fill_params(p: &mut SEncParamExt, s: &EncoderSettings) {
     p.iComplexityMode = LOW_COMPLEXITY;
     p.iPicWidth = width;
     p.iPicHeight = height;
-    p.fMaxFrameRate = s.max_fps;
+    p.fMaxFrameRate = s.max_fps.min(RATE_CONTROL_MAX_FPS);
     p.iRCMode = RC_BITRATE_MODE;
     p.bEnableFrameSkip = s.frame_skip;
     p.iTargetBitrate = bitrate;
@@ -458,7 +480,7 @@ fn fill_params(p: &mut SEncParamExt, s: &EncoderSettings) {
     let layer = &mut p.sSpatialLayers[0];
     layer.iVideoWidth = width;
     layer.iVideoHeight = height;
-    layer.fFrameRate = s.max_fps;
+    layer.fFrameRate = s.max_fps.min(RATE_CONTROL_MAX_FPS);
     layer.iSpatialBitrate = bitrate;
     layer.iMaxSpatialBitrate = UNSPECIFIED_BIT_RATE as c_int;
     // OpenH264 codes Baseline with CAVLC whatever iEntropyCodingModeFlag says.
@@ -827,6 +849,56 @@ mod tests {
     }
 
     #[test]
+    fn frames_above_60_fps_add_up_to_the_bitrate() {
+        // OpenH264 budgets each frame as one of at most 60 a second, so at 120 fps it is told
+        // half the bitrate: 2 Mbps is then 2083 bytes a frame, not 4167. (The grain costs
+        // about 2 KB a frame at the highest quantizer, so 1 Mbps would not show it.)
+        let (w, h) = (320, 240);
+        let fast = EncoderSettings {
+            max_fps: 120.0,
+            ..settings(w, h, 2_000_000, true)
+        };
+        assert_eq!(rate_control_bps(1_000_000, 60.0), 1_000_000);
+        assert_eq!(rate_control_bps(1_000_000, 30.0), 1_000_000);
+        assert_eq!(rate_control_bps(1_000_000, 120.0), 500_000);
+        assert_eq!(rate_control_bps(1_000_000, 90.0), 666_666);
+        for with_max in [false, true] {
+            let mut enc = if with_max {
+                H264Encoder::with_max_bitrate(&fast, 20_000_000).unwrap()
+            } else {
+                H264Encoder::new(&fast).unwrap()
+            };
+            assert_eq!(enc.settings().bitrate_bps, 2_000_000);
+            let mut rng = Rng(4);
+            let mut settle = |enc: &mut H264Encoder, from: usize| {
+                let sizes: Vec<usize> = (from..from + 30)
+                    .map(|i| {
+                        // Frames 1/120 s apart.
+                        enc.encode(&grain(w, h, &mut rng), i as u64 * 1000 / 120, false)
+                            .unwrap()
+                            .expect("frame skipping is off")
+                            .data
+                            .len()
+                    })
+                    .collect();
+                sizes[20..].iter().sum::<usize>() / 10
+            };
+            let size = settle(&mut enc, 0);
+            assert!(
+                size.abs_diff(2083) < 2083 / 5,
+                "{size} bytes/frame at 2 Mbps and 120 fps"
+            );
+            enc.set_bitrate(4_000_000).unwrap();
+            assert_eq!(enc.settings().bitrate_bps, 4_000_000);
+            let size = settle(&mut enc, 30);
+            assert!(
+                size.abs_diff(4167) < 4167 / 5,
+                "{size} bytes/frame at 4 Mbps and 120 fps"
+            );
+        }
+    }
+
+    #[test]
     fn static_reencodes_shrink_while_quality_rises() {
         let (w, h) = (640, 360);
         let mut enc = H264Encoder::new(&settings(w, h, 300_000, true)).unwrap();
@@ -1033,7 +1105,7 @@ mod tests {
                 ..good.clone()
             },
             EncoderSettings {
-                max_fps: 61.0,
+                max_fps: 121.0,
                 ..good.clone()
             },
             EncoderSettings {

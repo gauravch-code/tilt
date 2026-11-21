@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -46,6 +47,8 @@ struct Subscriber {
     /// Wakes the session's worker (a bounded(1) channel: one pending wake-up covers all).
     wake: Sender<()>,
     wants_new: bool,
+    /// The session's frame interval: how often it can take a new frame.
+    interval: Duration,
 }
 
 impl FrameHub {
@@ -70,14 +73,23 @@ impl FrameHub {
     }
 
     /// Adds a session's worker; `wake` is signalled when a frame it waits for is published.
-    pub fn subscribe(&self, sid: SessionId, wake: Sender<()>) {
+    /// `interval` is its frame interval.
+    pub fn subscribe(&self, sid: SessionId, wake: Sender<()>, interval: Duration) {
         self.lock().subscribers.insert(
             sid,
             Subscriber {
                 wake,
                 wants_new: false,
+                interval,
             },
         );
+    }
+
+    /// Changes a session's frame interval.
+    pub fn set_interval(&self, sid: SessionId, interval: Duration) {
+        if let Some(sub) = self.lock().subscribers.get_mut(&sid) {
+            sub.interval = interval;
+        }
     }
 
     /// Removes a session's worker. When it was the last one, this wakes the capture thread,
@@ -115,7 +127,17 @@ impl FrameHub {
 
     /// True when any subscriber waits for a newer frame.
     pub fn demand(&self) -> bool {
-        self.lock().subscribers.values().any(|s| s.wants_new)
+        self.pace().is_some()
+    }
+
+    /// The shortest frame interval among the subscribers waiting for a newer frame, which is
+    /// how often capture should grab for them; None when none waits. A grid of capture's own
+    /// at the fastest rate allowed would hand a slower viewer frames it must hold back, each
+    /// older by the time it goes out.
+    pub fn pace(&self) -> Option<Duration> {
+        let inner = self.lock();
+        let waiting = inner.subscribers.values().filter(|s| s.wants_new);
+        waiting.map(|s| s.interval).min()
     }
 
     pub fn latest(&self) -> Option<Arc<Frame>> {
@@ -235,12 +257,15 @@ mod tests {
     use super::*;
     use crate::video::convert::FramePool;
 
+    /// A 60 fps viewer's frame interval.
+    const FI: Duration = Duration::from_micros(16_667);
+
     #[test]
     fn demand_follows_wants_and_wakes_capture_on_the_rising_edge() {
         let (hub, wake) = FrameHub::new();
         let (tx, _rx) = crossbeam_channel::bounded(1);
-        hub.subscribe(1, tx.clone());
-        hub.subscribe(2, tx);
+        hub.subscribe(1, tx.clone(), FI);
+        hub.subscribe(2, tx, FI);
         assert!(!hub.demand() && wake.try_recv().is_err());
 
         hub.set_wants(1, true);
@@ -325,8 +350,8 @@ mod tests {
         let (hub, _wake) = FrameHub::new();
         let (tx1, rx1) = crossbeam_channel::bounded(1);
         let (tx2, rx2) = crossbeam_channel::bounded(1);
-        hub.subscribe(1, tx1);
-        hub.subscribe(2, tx2);
+        hub.subscribe(1, tx1, FI);
+        hub.subscribe(2, tx2, FI);
         hub.set_wants(1, true);
         let pool = FramePool::new();
         let frame = |seq| frame(&pool, seq);
@@ -367,8 +392,8 @@ mod tests {
         let (hub, wake) = FrameHub::new();
         let (tx_a, rx_a) = crossbeam_channel::bounded(1);
         let (tx_b, rx_b) = crossbeam_channel::bounded(1);
-        hub.subscribe(1, tx_a);
-        hub.subscribe(2, tx_b);
+        hub.subscribe(1, tx_a, FI);
+        hub.subscribe(2, tx_b, FI);
         let pool = FramePool::new();
         hub.set_wants(1, true);
         hub.publish(frame(&pool, 1));
@@ -387,7 +412,7 @@ mod tests {
         assert!(rx_a.try_recv().is_ok());
         // Before any frame, anything published counts as newer.
         let (hub, _wake) = FrameHub::new();
-        hub.subscribe(1, crossbeam_channel::bounded(1).0);
+        hub.subscribe(1, crossbeam_channel::bounded(1).0, FI);
         assert!(!hub.want_newer(1, 0) && hub.demand());
         hub.publish(frame(&pool, 1));
         assert!(hub.want_newer(1, 0));
@@ -400,7 +425,7 @@ mod tests {
         hub.wake_capture();
         assert!(wake.try_recv().is_ok());
         hub.publish(frame(&pool, 1));
-        hub.subscribe(1, crossbeam_channel::bounded(1).0);
+        hub.subscribe(1, crossbeam_channel::bounded(1).0, FI);
         hub.screen_changed();
         assert_eq!(
             hub.latest().map(|f| f.seq),
@@ -421,7 +446,7 @@ mod tests {
         // Pipeline P5: a paused or blocked session keeps `latest`, but it no longer shows the
         // screen.
         let (hub, _wake) = FrameHub::new();
-        hub.subscribe(1, crossbeam_channel::bounded(1).0);
+        hub.subscribe(1, crossbeam_channel::bounded(1).0, FI);
         let pool = FramePool::new();
         hub.screen_changed();
         assert!(!hub.latest_is_stale(), "nothing to be stale");

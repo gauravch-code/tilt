@@ -1,6 +1,6 @@
 //! tilt-testpattern: a full-screen X11 test pattern for end-to-end checks (brief section 7).
 //! A 256x256 marker changes colour on every key press and left click, `--animate` adds a bar
-//! that moves at 60 Hz, and every input event is logged as one JSON line.
+//! that moves at 60 Hz (or `--fps`), and every input event is logged as one JSON line.
 
 use std::fs::File;
 use std::io::{self, LineWriter, Write};
@@ -31,9 +31,13 @@ use x11rb::{COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, CURRENT_TIME, NONE};
     about = "Full-screen X11 test pattern with an input-driven marker and a JSON event log"
 )]
 struct Args {
-    /// Move a white bar 8 px per 60 Hz tick, for frame-rate tests
+    /// Move a white bar 8 px per tick, for frame-rate tests
     #[arg(long)]
     animate: bool,
+
+    /// Ticks per second of the `--animate` bar
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=240))]
+    fps: u32,
 
     /// Event log (JSON lines, also echoed to stdout)
     #[arg(long, default_value = "/tmp/testpattern.log")]
@@ -49,7 +53,6 @@ const BAR_TOP: i16 = 400;
 const BAR_HEIGHT: u16 = 160;
 const BAR_WIDTH: u16 = 64;
 const BAR_STEP: u16 = 8;
-const TICK: Duration = Duration::from_micros(16_667);
 const BAR_COLOR: (u8, u8, u8) = (255, 255, 255);
 
 fn main() -> anyhow::Result<()> {
@@ -113,10 +116,11 @@ fn main() -> anyhow::Result<()> {
         let gc = new_gc(&conn, win)?;
         let (conn, bar) = (conn.clone(), pixel.of(BAR_COLOR));
         let bg = pixel.of(BACKGROUND);
+        let tick = Duration::from_secs(1) / args.fps;
         thread::Builder::new()
             .name("animate".into())
             .spawn(move || {
-                if let Err(e) = animate(&conn, win, gc, width, bar, bg) {
+                if let Err(e) = animate(&conn, win, gc, width, bar, bg, tick) {
                     eprintln!("tilt-testpattern: animation stopped: {e:#}");
                 }
             })?;
@@ -331,7 +335,7 @@ fn focus(conn: &RustConnection, win: Window) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Moves the bar one step per 60 Hz tick. The new bar is drawn before the uncovered strip of
+/// Moves the bar one step per `tick`. The new bar is drawn before the uncovered strip of
 /// the old one is erased, so a frame grabbed between the two requests never misses the bar.
 fn animate(
     conn: &RustConnection,
@@ -340,6 +344,7 @@ fn animate(
     width: u16,
     bar: u32,
     bg: u32,
+    tick: Duration,
 ) -> anyhow::Result<()> {
     let rect = |x: u16, w: u16| Rectangle {
         x: x as i16,
@@ -360,7 +365,7 @@ fn animate(
         }
         conn.flush()?;
 
-        next += TICK;
+        next += tick;
         let now = Instant::now();
         match next.checked_duration_since(now) {
             Some(wait) => thread::sleep(wait),

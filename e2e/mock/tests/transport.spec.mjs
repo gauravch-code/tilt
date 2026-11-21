@@ -2,7 +2,7 @@
 // fixtures.mjs, which can deliver video streams out of order, fail one, or never connect: what a
 // real QUIC path does only at random.
 import {
-  expect, from, open, pollState, sessionOf, state, stats, test, waitDrawn,
+  collect, command, controlling, expect, from, keyLog, open, pollState, sessionOf, state, stats, test, waitDrawn,
 } from './fixtures.mjs';
 
 test.describe('recovery shards', () => {
@@ -17,6 +17,96 @@ test.describe('recovery shards', () => {
     expect(acks.length).toBeGreaterThanOrEqual(55);
     expect(acks).toEqual(acks.map((_, i) => i + 1));
     expect(from(mock, id, 'idr')).toEqual([]);
+    expect(mock.violations).toEqual([]);
+  });
+});
+
+test.describe('the datagram lane', () => {
+  test.use({ wtMode: 'datagrams', mockOptions: { datagrams: true } });
+
+  test('rebuilds frames from any k shards and takes a resent frame from its stream', async ({ page, mock }) => {
+    await open(page, mock);
+    await waitDrawn(page, 60);
+    expect((await stats(page)).decodeErrors).toBe(0);
+    const id = await sessionOf(page);
+    expect(from(mock, id, 'hello')[0]).toMatchObject({ datagrams: 1, fps: 60 });
+    // Every frame once, in order, although each lost shards and every tenth lost too many.
+    const acks = from(mock, id, 'ACK').map((a) => a.seq);
+    expect(acks.length).toBeGreaterThanOrEqual(55);
+    expect(acks).toEqual(acks.map((_, i) => i + 1));
+    const lane = await page.evaluate(() => ({
+      on: window.tilt.ws.lane,
+      frames: window.tilt.ws.fecFrames,
+      repaired: window.tilt.ws.fecRepaired,
+      resent: window.fakeWt.resent,
+    }));
+    expect(lane.on).toBe(true);
+    expect(lane.frames).toBeGreaterThanOrEqual(40);
+    expect(lane.repaired).toBeGreaterThanOrEqual(20);
+    expect(lane.resent).toBeGreaterThanOrEqual(4);
+    // The page reports what arrived: every frame before `base`, and, while one is missing,
+    // the later ones that are there.
+    const have = from(mock, id, 'HAVE');
+    expect(have.length).toBeGreaterThanOrEqual(40);
+    expect(Math.max(...have.map((h) => h.base))).toBeGreaterThanOrEqual(55);
+    expect(have.some((h) => h.base % 10 === 7 && h.bits !== '0')).toBe(true);
+    // ACKs came as datagrams first; the stream's copies, 200 ms later, changed nothing.
+    expect(from(mock, id, 'ACK').every((a) => a.datagram)).toBe(true);
+    expect(from(mock, id, 'ACK_AGAIN').every((a) => !a.datagram)).toBe(true);
+    expect(from(mock, id, 'idr')).toEqual([]);
+    expect(mock.violations).toEqual([]);
+  });
+
+  // The same bytes as in src/fec.rs (parity_matches_the_reference_vector): the server's
+  // encoder and this decoder hold to one wire format.
+  test('rebuilds the reference vector from its parity', async ({ page, mock }) => {
+    await open(page, mock);
+    const rebuilt = await page.evaluate(async () => {
+      const { fecRebuild } = await import('./transport.js');
+      const hex = (s) => Uint8Array.from(s.match(/../g), (b) => parseInt(b, 16));
+      const message = '010a050000002d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d14';
+      const shards = [
+        hex(message.slice(0, 28)),
+        hex(message.slice(28, 56)),
+        hex(message.slice(56).padEnd(28, '0')),
+        hex('808a67634243f04b8eff330e7e99'),
+        hex('b9a95c42dac1dea7c5a465576a50'),
+      ];
+      const out = {};
+      for (const kept of [[0, 1, 2], [0, 1, 3], [2, 3, 4], [1, 3, 4], [0, 4, 3]]) {
+        const got = fecRebuild(40, 3, 14, new Map(kept.map((i) => [i, shards[i]])));
+        out[kept.join('')] = got && [...got].map((b) => b.toString(16).padStart(2, '0')).join('') === message;
+      }
+      out.short = fecRebuild(40, 3, 14, new Map([[0, shards[0]], [4, shards[4]]]));
+      return out;
+    });
+    expect(rebuilt).toEqual({ '012': true, '013': true, '234': true, '134': true, '043': true, short: null });
+  });
+
+  test('input goes ahead of a slow control stream, once and in order', async ({ page, mock }) => {
+    await open(page, mock, 'token=devtoken&remote=1');
+    const id = await controlling(page);
+    const since = mock.messages.length;
+    for (const [keysym, down] of [[0x61, true], [0x61, false], [0x62, true], [0x62, false]]) {
+      await command(page, { type: 'tilt:key', keysym, down });
+    }
+    const keys = await collect(mock, id, 'KEY', since, 4, 0);
+    expect(keyLog(keys)).toEqual(['down 61', 'up 61', 'down 62', 'up 62']);
+    // Each was acted on from a datagram: before the control stream, 200 ms behind, had it.
+    expect(keys.every((k) => k.datagram && k.accepted)).toBe(true);
+    // A message that only travels on the stream keeps its place: the key after it waits.
+    const before = mock.messages.length;
+    await command(page, { type: 'tilt:control', take: false });
+    await command(page, { type: 'tilt:control', take: true });
+    await command(page, { type: 'tilt:key', keysym: 0x63 });
+    const after = await collect(mock, id, ['control', 'KEY'], before, 3, 400);
+    expect(after.map((m) => m.type)).toEqual(['control', 'control', 'KEY']);
+    expect(after[2]).toMatchObject({ keysym: 0x63, accepted: true });
+    // The stream's copies of the first four arrived meanwhile and were not typed again.
+    expect(keyLog(from(mock, id, 'KEY', since))).toEqual(['down 61', 'up 61', 'down 62', 'up 62', 'down 63']);
+    const runs = from(mock, id, 'INPUT', since);
+    expect(runs.length).toBeGreaterThanOrEqual(4);
+    expect(runs.flatMap((r) => r.used)).toEqual([...new Set(runs.flatMap((r) => r.used))]);
     expect(mock.violations).toEqual([]);
   });
 });

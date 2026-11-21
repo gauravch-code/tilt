@@ -72,6 +72,11 @@ struct Args {
     #[arg(long)]
     json: bool,
 
+    /// The display refresh rate to name in hello, which caps the session's frame rate (the
+    /// server assumes 60 for a client that names none)
+    #[arg(long)]
+    fps: Option<u32>,
+
     /// Exit non-zero when the measured fps is lower
     #[arg(long)]
     min_fps: Option<f64>,
@@ -218,7 +223,7 @@ async fn run(args: &Args) -> anyhow::Result<Report> {
 }
 
 async fn measure(session: &mut Session, args: &Args) -> anyhow::Result<Report> {
-    let role = session.handshake(args.token.as_deref()).await?;
+    let role = session.handshake(args.token.as_deref(), args.fps).await?;
     let (w, h) = session.screen();
     eprintln!(
         "tilt-probe: connected to {} as {role}, screen {w}x{h}",
@@ -612,7 +617,7 @@ impl Session {
         })
     }
 
-    async fn handshake(&mut self, token: Option<&str>) -> anyhow::Result<String> {
+    async fn handshake(&mut self, token: Option<&str>, fps: Option<u32>) -> anyhow::Result<String> {
         let mut hello = json!({
             "t": "hello",
             "v": 1,
@@ -620,6 +625,9 @@ impl Session {
         });
         if let Some(token) = token {
             hello["token"] = token.into();
+        }
+        if let Some(fps) = fps {
+            hello["fps"] = fps.into();
         }
         self.send_json(&hello);
         let deadline = Instant::now() + SETUP_TIMEOUT;

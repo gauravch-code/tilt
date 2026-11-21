@@ -68,7 +68,7 @@ Open `http://<host>:6090/#token=<token>&remote=1`.
 
 tilt serves the page over HTTP and streams over WebTransport (QUIC, UDP), on port 6090 for
 both by default (`--udp-port` moves the UDP side). Each frame travels on its own, so a lost packet delays only that frame, never
-the cursor, your input or the frames after it. There is one protocol and nothing to fall back to:
+the cursor, your input or the frames after it, and on a long path not even that frame (below). There is one protocol and nothing to fall back to:
 
 - The viewer's browser must reach the port over **TCP and UDP**: TCP for the page, UDP for the
   stream. An HTTPS gateway or proxy cannot carry the stream.
@@ -83,6 +83,23 @@ Key press to drawn in Chrome, 1080p, with the stream through a UDP relay as on S
 | local | 4 / 7 ms |
 | 50 ms round trip | 55 / 56 ms |
 | 50 ms round trip, 2% packet loss | 54 / 106 ms |
+
+**Across continents.** A stream resends a lost packet a round trip later, which at 250 ms is a
+freeze you see. On paths of 60 ms or more tilt therefore sends frames as QUIC datagrams with
+parity (any lost packet of a frame is rebuilt from the others at once), and the page sends
+your input and its acknowledgements the same way, each datagram repeating the last few. And
+the first frames after a still screen go out at once, where QUIC's congestion control used to
+hold them back a round trip. Nothing to configure; [performance](performance.md#across-continents)
+has the numbers. Key press to drawn at 720p over a 255 ms round trip (`tools/wan/run.sh`):
+
+| link | p50 / p95 / worst of 80 | before 0.7 |
+|---|---|---|
+| no loss | 262 / 265 / 266 ms | 263 / 265 / 266 ms |
+| 1% packet loss | 261 / 264 / 266 ms | 262 / 265 / 551 ms |
+| 3% packet loss | 262 / 266 / 267 ms | 263 / 588 / 823 ms |
+
+Scrolling over the same link at 1% loss, 27–47% of the viewer's refreshes used to show no new
+frame; now about 1% do, as with no loss at all.
 
 **Firecracker (or any VM behind NAT).** Forward the port for both protocols. If browsers dial a
 different UDP port (or host) than tilt's, say which with `--udp-public`:
@@ -229,6 +246,7 @@ Add these to the link's fragment, after the token: `#token=…&remote=1&bg=10101
 | `scale=1` | 1:1 pixels rather than fitted |
 | `touch=trackpad`, `touch=direct` | how touch moves the pointer |
 | `smooth=0` | show frames as they arrive, with no jitter smoothing |
+| `fps=N` | ask for at most N frames a second, rather than the display's refresh rate (`--max-fps` still caps it) |
 
 ## Flags
 
@@ -245,7 +263,7 @@ Every flag also has an environment variable. With none of `--token`, `--token-fi
 | `--view-token <TOKEN>` | `TILT_VIEW_TOKEN` | | token for view-only viewers |
 | `--token-file <PATH>` | `TILT_TOKEN_FILE` | | control token from a file, re-read on every connection |
 | `--no-auth` | `TILT_NO_AUTH` | off | everyone gets control. Local testing only |
-| `--max-fps <N>` | `TILT_MAX_FPS` | 60 | frame rate cap per viewer, 1 to 60 |
+| `--max-fps <N>` | `TILT_MAX_FPS` | 120 | frame rate cap per viewer, 1 to 120; a viewer gets its display's refresh rate if that is lower |
 | `--resize <MIN>` | `TILT_RESIZE` | off | the screen takes each control viewer's window shape, at least MIN (`WxH`) per side. Xvfb resizes only within its startup screen: start it large, e.g. `-screen 0 2560x1600x24` |
 
 <details>
@@ -294,6 +312,14 @@ While the page has control, the clipboard is shared both ways, as text up to 64 
   A viewer whose page is hidden costs nothing (its video stops), but every viewer watching a busy
   screen has its own encoder (below). `--max-viewers` is accepted and ignored.
 - **Small VM (2 vCPUs)?** Use `--max-fps 30` if the desktop's own apps need the CPU. Firecracker or another CPU-only microVM: see [performance](performance.md).
+- **120 Hz display?** The page tells tilt its display's refresh rate, and gets up to that many
+  frames a second (`--max-fps` caps it, 120 by default); a 60 Hz viewer gets 60 as before. The
+  screen must change that often to fill them: most X applications draw 60 times a second.
+- **Viewer far from the machine?** What you feel is the round trip between the two, about
+  250 ms from India to the US, and no software shortens it: tilt adds under 10 ms of its own,
+  and a key press shows one round trip later. Run the machine in a region near its viewers if
+  you can. What tilt does take care of is that a lossy long path stays that fast and smooth
+  ([below](#network)), and the pointer never waits at all: the page draws it itself.
 - **Slow link?** It adapts by itself: bitrate first, then frame rate. Frames are never dropped
   once sent, and each one is the newest screen.
 - **Jittery link (Wi-Fi, mobile)?** The page shows frames on the rhythm they were captured at,
@@ -392,6 +418,8 @@ can take the mouse and keyboard. It replaces x11vnc + noVNC.
   are read and converted.
 - Flow control is ack-based: frames are never dropped, the newest frame goes out when credit
   returns, and the bitrate follows the measured link.
+- On long paths frames go as datagrams with Reed-Solomon parity and input as repeated
+  datagrams, with the reliable streams behind both: a lost packet costs no round trip.
 - Tokens are checked in the first message of the stream, never in a URL.
 
 The wire protocol is in [protocol.md](protocol.md).

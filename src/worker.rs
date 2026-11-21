@@ -1,6 +1,6 @@
 //! Per-session encoder thread `tilt-enc-<sid>` (brief section 5.3).
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -32,6 +32,8 @@ pub struct Inbox {
     sent_seq: AtomicU32,
     /// clock::now_us() when the writer last finished writing a VIDEO message; 0 before any.
     written_us: AtomicU64,
+    /// Flow control finds the link congested (FlowControl::congested), for the writer.
+    congested: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -44,6 +46,8 @@ struct Pending {
     paused: bool,
     /// The newest video on/off state.
     video: Option<bool>,
+    /// The viewer's display refresh rate, newly told.
+    fps: Option<u32>,
     shutdown: bool,
 }
 
@@ -56,6 +60,7 @@ impl Inbox {
             wake_rx,
             sent_seq: AtomicU32::new(0),
             written_us: AtomicU64::new(0),
+            congested: AtomicBool::new(false),
         })
     }
 
@@ -98,6 +103,11 @@ impl Inbox {
         });
     }
 
+    /// The viewer's display turned out to refresh `fps` times a second.
+    pub fn fps(&self, fps: u32) {
+        self.update(|p| p.fps = Some(fps));
+    }
+
     pub fn shutdown(&self) {
         self.update(|p| p.shutdown = true);
     }
@@ -106,6 +116,11 @@ impl Inbox {
     pub fn written(&self) {
         self.written_us
             .store(clock::now_us().max(1), Ordering::Relaxed);
+    }
+
+    /// Whether flow control finds the link congested: no parity for large frames then.
+    pub fn congested(&self) -> bool {
+        self.congested.load(Ordering::Relaxed)
     }
 
     fn last_write(&self) -> Option<Instant> {
@@ -146,19 +161,20 @@ const ENCODER_RETRY_MAX: Duration = Duration::from_secs(2);
 const PATCH_AREA_DIVISOR: u64 = 8;
 const PATCH_MIN_BYTES: usize = 8 * 1024;
 
-/// Starts the encoder thread for `sid`. It writes VIDEO, `screen`, `stats` and `error`
-/// messages to `out` (bounded, with blocking_send) and exits on `inbox.shutdown()` or once
-/// the writer has gone.
+/// Starts the encoder thread for `sid`, which sends at most `fps` frames a second. It writes
+/// VIDEO, `screen`, `stats` and `error` messages to `out` (bounded, with blocking_send) and
+/// exits on `inbox.shutdown()` or once the writer has gone.
 pub fn spawn_worker(
     sid: SessionId,
     state: Arc<AppState>,
     inbox: Arc<Inbox>,
     out: mpsc::Sender<OutMsg>,
+    fps: u32,
 ) -> anyhow::Result<JoinHandle<()>> {
     let handle = std::thread::Builder::new()
         .name(format!("tilt-enc-{sid}"))
         .spawn(move || {
-            let mut worker = Worker::new(sid, state, inbox, out);
+            let mut worker = Worker::new(sid, state, inbox, out, fps);
             worker.run();
             worker.state.hub.set_wants(sid, false);
             debug!(session = sid, "encoder thread done");
@@ -372,6 +388,8 @@ struct Worker {
     sid: SessionId,
     state: Arc<AppState>,
     cfg: Arc<Config>,
+    /// The session's frame rate cap: `--max-fps`, or the viewer's display if that is slower.
+    fps: u32,
     inbox: Arc<Inbox>,
     out: mpsc::Sender<OutMsg>,
     started: Instant,
@@ -418,10 +436,12 @@ impl Worker {
         state: Arc<AppState>,
         inbox: Arc<Inbox>,
         out: mpsc::Sender<OutMsg>,
+        fps: u32,
     ) -> Worker {
         let now = Instant::now();
         let cfg = Arc::clone(&state.cfg);
-        let flow_config = cfg.flow_config();
+        let fps = fps.clamp(1, cfg.max_fps);
+        let flow_config = cfg.flow_config(fps);
         let max_bitrate = flow_config.max_bps;
         let flow = FlowControl::new(flow_config, now);
         let bitrate = flow.stats().bitrate_bps;
@@ -429,11 +449,12 @@ impl Worker {
         Worker {
             sid,
             cfg: Arc::clone(&cfg),
+            fps,
             state,
             inbox,
             out,
             started: now,
-            sched: Schedule::new(cfg.frame_interval(), cfg.tail_frames),
+            sched: Schedule::new(Duration::from_secs(1) / fps, cfg.tail_frames),
             flow,
             enc: None,
             bitrate,
@@ -505,6 +526,31 @@ impl Worker {
         if p.idr {
             self.sched.force_idr = true;
         }
+        if let Some(fps) = p.fps {
+            self.set_fps(fps);
+        }
+    }
+
+    /// The viewer's display refreshes `fps` times a second: the session's frame rate cap
+    /// follows, within `--max-fps`.
+    fn set_fps(&mut self, fps: u32) {
+        let fps = fps.clamp(1, self.cfg.max_fps);
+        if fps == self.fps {
+            return;
+        }
+        debug!(
+            session = self.sid,
+            from = self.fps,
+            to = fps,
+            "frame rate cap"
+        );
+        self.fps = fps;
+        self.sched.fi = Duration::from_secs(1) / fps;
+        self.flow.set_fps(fps);
+        self.state.hub.set_interval(self.sid, self.sched.fi);
+        // Its rate control was set up for the old rate: a new encoder, and so a keyframe.
+        self.enc = None;
+        self.last_au = None;
     }
 
     fn step(&mut self) -> Result<(), Closed> {
@@ -523,6 +569,10 @@ impl Worker {
         if now >= self.next_flow_tick && !self.flow.quiet() {
             self.next_flow_tick = now + FLOW_TICK;
             self.retarget(now);
+        }
+        let congested = self.flow.congested(now);
+        if self.inbox.congested.swap(congested, Ordering::Relaxed) != congested {
+            debug!(session = self.sid, congested, "link");
         }
         if now >= self.next_stats {
             self.next_stats = now + STATS_EVERY;
@@ -710,7 +760,7 @@ impl Worker {
         };
         let started = Instant::now();
         let rects = patch::even_rects(&damage, w, h);
-        let budget = self.bitrate as usize / 8 / self.cfg.max_fps.max(1) as usize;
+        let budget = self.bitrate as usize / 8 / self.fps as usize;
         let max_area = u64::from(w) * u64::from(h) / PATCH_AREA_DIVISOR;
         let Some(data) = patch::encode(&frame.image, &rects, max_area, budget.max(PATCH_MIN_BYTES))
         else {
@@ -770,7 +820,9 @@ impl Worker {
         }
         self.enc = None;
         let profile = self.cfg.resolved_profile(self.state.cpus);
-        let settings = self.cfg.encoder_settings(w, h, self.bitrate, profile);
+        let settings = self
+            .cfg
+            .encoder_settings(w, h, self.fps, self.bitrate, profile);
         match H264Encoder::with_max_bitrate(&settings, self.max_bitrate) {
             Ok(enc) => {
                 if self.announced != (w, h) {
@@ -879,7 +931,7 @@ impl Worker {
                 inflight: flow.inflight_frames,
                 skipped: self.skipped,
                 viewers: self.state.sessions.count() as u32,
-                gov_fps: self.cfg.max_fps,
+                gov_fps: self.fps,
             };
             self.send(OutMsg::Text(ServerText::Stats(stats).to_json()))?;
         }
@@ -903,6 +955,8 @@ mod tests {
     use crate::video::convert::FramePool;
 
     const MS: Duration = Duration::from_millis(1);
+    /// A 60 fps viewer's frame interval.
+    const FI: Duration = Duration::from_micros(16_667);
 
     fn sched() -> (Schedule, Instant) {
         (
@@ -1187,7 +1241,7 @@ mod tests {
             Some((5, 2, t0 + MS)),
             "the newest, as first received"
         );
-        assert!(!p.idr && !p.paused && p.video.is_none() && !p.shutdown);
+        assert!(!p.idr && !p.paused && p.video.is_none() && p.fps.is_none() && !p.shutdown);
         assert!(inbox.take().ack.is_none());
         // Seqs wrap (skipping 0).
         inbox.sent_seq.store(2, Ordering::Release);
@@ -1205,9 +1259,9 @@ mod tests {
     fn worker(args: &[&str]) -> (Worker, mpsc::Receiver<OutMsg>, FramePool) {
         let state = crate::server::test_state(&[&["--no-auth"], args].concat());
         let inbox = Inbox::new();
-        state.hub.subscribe(1, inbox.waker());
+        state.hub.subscribe(1, inbox.waker(), FI);
         let (out, rx) = mpsc::channel(1024);
-        (Worker::new(1, state, inbox, out), rx, FramePool::new())
+        (Worker::new(1, state, inbox, out, 60), rx, FramePool::new())
     }
 
     fn publish(w: &Worker, pool: &FramePool, seq: u64, (width, height): (u32, u32)) {
@@ -1424,7 +1478,7 @@ mod tests {
         // As if that frame went 6 s ago, with nothing written or acked since, and a keyframe
         // would be allowed.
         let long_ago = Instant::now().checked_sub(Duration::from_secs(6)).unwrap();
-        w.flow = FlowControl::new(w.cfg.flow_config(), long_ago);
+        w.flow = FlowControl::new(w.cfg.flow_config(60), long_ago);
         w.flow.on_sent(w.seq, 1_000, long_ago);
         w.sched.last_idr = Some(long_ago);
         assert!(w.flow.stalled(Instant::now(), w.inbox.last_write()));
@@ -1606,7 +1660,7 @@ mod tests {
             let state = crate::server::test_state(&["--no-auth"]);
             let inbox = Inbox::new();
             let (out, rx) = mpsc::channel(8);
-            let handle = spawn_worker(1, state, Arc::clone(&inbox), out).unwrap();
+            let handle = spawn_worker(1, state, Arc::clone(&inbox), out, 60).unwrap();
             if shutdown {
                 inbox.shutdown();
             } else {
