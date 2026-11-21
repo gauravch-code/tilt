@@ -20,6 +20,7 @@ const BACKOFF_MS = [250, 500, 1000, 2000, 5000];
 const PING_MS = 1000;
 const DEAD_MS = 5000;
 const WELCOME_TIMEOUT_MS = 10000;
+const FIRST_FRAME_TIMEOUT_MS = 10000;
 // After a reconnect, how long this page waits for another viewer to let go of control before
 // giving up taking it back.
 const RETAKE_MS = 35000;
@@ -184,6 +185,7 @@ const conn = {
   attempt: 0,
   timer: 0,
   openedAt: 0,
+  firstFrameDeadline: null,
   lastRecvAt: 0,
   pingSentAt: 0,
   welcomed: false,
@@ -383,6 +385,7 @@ function endSession() {
   if (stats.control) conn.lost = stats.session;
   conn.take = null;
   conn.welcomed = false;
+  conn.firstFrameDeadline = null;
   conn.pingSentAt = 0;
   conn.held = null;
   conn.holder = null;
@@ -393,6 +396,7 @@ function endSession() {
   clearTimeout(video.idrTimer);
   video.idrTimer = 0;
   video.lastIdrAt = -Infinity;
+  video.sizeNotice = false;
   cursor.shapes.clear();
   serverStats = null;
   host.changed();
@@ -434,6 +438,7 @@ function onJson(text) {
 function onWelcome(m) {
   const first = !conn.everWelcomed;
   conn.welcomed = true;
+  conn.firstFrameDeadline = performance.now() + FIRST_FRAME_TIMEOUT_MS;
   conn.everWelcomed = true;
   conn.notice = '';
   stats.session = String(m.session ?? '');
@@ -555,15 +560,18 @@ function linkLost(notice) {
   scheduleReconnect();
 }
 
-// Once a second: handshake timeout, liveness, PING, the pending take, the decoder watchdog and
-// the stats overlay.
+// Once a second: handshake timeout, liveness, first video frame, PING, the pending take, the
+// decoder watchdog and the stats overlay.
 function tick() {
   const now = performance.now();
   if (conn.ws && !conn.welcomed && now - conn.openedAt > WELCOME_TIMEOUT_MS) {
     linkLost('The server did not answer.');
   } else if (conn.ws && conn.welcomed) {
     if (conn.pingSentAt && now - conn.lastRecvAt > DEAD_MS) linkLost('The connection stopped responding.');
-    else sendPing(now);
+    // Control can still answer PINGs when an earlier video stream is missing or stalled.
+    else if (videoOn && !video.sizeNotice && conn.firstFrameDeadline !== null && now >= conn.firstFrameDeadline) {
+      linkLost('The desktop did not send a playable video frame.');
+    } else sendPing(now);
   }
   // A take that still finds control held when its time is up gives up; one held back only because
   // the page is hidden (control free) waits for the page to be shown.
@@ -986,6 +994,7 @@ function draw(frame) {
   stats.lastDrawnSeq = Math.round(frame.timestamp / 1000);
   frame.close();
   stats.framesDrawn++;
+  conn.firstFrameDeadline = null;
   if (opts.probe) probe(stats.lastDrawnSeq);
   // A fresh frame in a live session ends "Connecting…", "Reconnecting…" and decoder trouble alike;
   // frames the decoder still held when the screen size failed do not.
@@ -1556,6 +1565,7 @@ function wire() {
   document.addEventListener('visibilitychange', () => {
     syncVideo();
     if (document.visibilityState === 'hidden') return;
+    if (conn.firstFrameDeadline !== null) conn.firstFrameDeadline = performance.now() + FIRST_FRAME_TIMEOUT_MS;
     // Hidden pages do not reconnect, and background timers are throttled: connect now.
     if (!conn.ws && !conn.fatal) {
       conn.attempt = 0;
