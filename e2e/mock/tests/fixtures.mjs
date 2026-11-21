@@ -12,7 +12,9 @@ export { expect };
  * Runs in the page: window.WebTransport carried over the mock's WebSocket (/stream next to the
  * page) in the WebTransport framing (docs/protocol.md): control messages on one bidirectional
  * stream, each VIDEO message on a unidirectional stream of its own. `mode` 'shuffle' delivers
- * every other video stream late, 'lose' fails the 10th, 'never' never connects.
+ * every other video stream late, 'lose' fails the 10th, 'never' never connects. 'datagrams' has
+ * the datagram lane: VIDEO arrives as datagrams with parity, of which some are lost, and
+ * everything the page writes to the control stream arrives 200 ms late, as behind a lost packet.
  */
 function installFakeWebTransport({ mode }) {
   const wsUrl = (() => {
@@ -31,6 +33,44 @@ function installFakeWebTransport({ mode }) {
     return out;
   };
   const once = (bytes) => new ReadableStream({ start(c) { c.enqueue(bytes); c.close(); } });
+  // The lane's Reed-Solomon code, written from docs/protocol.md: GF(2^8) with polynomial 0x11d.
+  const gfMul = (a, b) => {
+    let p = 0;
+    for (; b; b >>= 1) {
+      if (b & 1) p ^= a;
+      a <<= 1;
+      if (a & 0x100) a ^= 0x11d;
+    }
+    return p;
+  };
+  const gfInv = (a) => {
+    for (let b = 1; b < 256; b++) if (gfMul(a, b) === 1) return b;
+    return 0;
+  };
+  /** The FEC datagrams of VIDEO message `b`: `k` data shards and `r` of parity. */
+  const fecShards = (b, k, r) => {
+    const size = Math.ceil(b.length / k);
+    return Array.from({ length: k + r }, (_, index) => {
+      const d = new Uint8Array(11 + size);
+      const dv = new DataView(d.buffer);
+      d[0] = 0x06;
+      d.set(b.subarray(2, 6), 1);
+      dv.setUint32(5, b.length, true);
+      d[9] = k;
+      d[10] = index;
+      if (index < k) {
+        d.set(b.subarray(index * size, (index + 1) * size), 11);
+      } else {
+        const x = 255 - (index - k);
+        for (let i = 0; i < k; i++) {
+          const w = gfMul(x, gfInv(x ^ i));
+          const from = b.subarray(i * size, (i + 1) * size);
+          for (let n = 0; n < from.length; n++) d[11 + n] ^= gfMul(w, from[n]);
+        }
+      }
+      return d;
+    });
+  };
   window.WebTransport = class {
     constructor(url, options) {
       log.created++;
@@ -42,8 +82,27 @@ function installFakeWebTransport({ mode }) {
       this.closed = new Promise((r) => { resolveClosed = r; });
       let control;
       let uni;
+      let datagrams;
       this.controlReadable = new ReadableStream({ start(c) { control = c; } });
       this.incomingUnidirectionalStreams = new ReadableStream({ start(c) { uni = c; } });
+      if (mode === 'datagrams') {
+        const wt = this;
+        this.datagrams = {
+          incomingHighWaterMark: 1,
+          outgoingHighWaterMark: 1,
+          readable: new ReadableStream({ start(c) { datagrams = c; } }),
+          // A datagram goes to the mock as a binary message behind a 0xfd byte.
+          writable: new WritableStream({
+            write(chunk) {
+              log.datagramsOut = (log.datagramsOut || 0) + 1;
+              const out = new Uint8Array(1 + chunk.length);
+              out[0] = 0xfd;
+              out.set(chunk, 1);
+              wt.ws.send(out);
+            },
+          }),
+        };
+      }
       // As if UDP were blocked: no handshake ever completes.
       if (mode === 'never') return;
       const ws = new WebSocket(wsUrl);
@@ -68,6 +127,26 @@ function installFakeWebTransport({ mode }) {
         }
         videos++;
         const key = (b[1] & 1) !== 0;
+        if (mode === 'datagrams' && videos > 2) {
+          const seq = new DataView(b.buffer, b.byteOffset).getUint32(2, true);
+          const k = Math.max(1, Math.ceil(b.length / 1000));
+          const r = Math.ceil(k / 4) + 1;
+          const shards = fecShards(b, k, r);
+          if (seq % 10 === 7) {
+            // One shard too few ever arrives: the server sends the frame again on a stream.
+            shards.slice(0, k - 1).forEach((s) => datagrams.enqueue(s));
+            log.resent = (log.resent || 0) + 1;
+            setTimeout(() => uni.enqueue(once(b)), 150);
+            return;
+          }
+          // As many lost as there is parity, a different run each frame; one comes twice.
+          const lost = seq % (k + r);
+          shards.forEach((s, i) => {
+            if ((i - lost + k + r) % (k + r) >= r) datagrams.enqueue(s);
+          });
+          datagrams.enqueue(shards[(lost + r) % (k + r)]);
+          return;
+        }
         if (mode === 'reorder-delay' && videos === 10) {
           setTimeout(() => uni.enqueue(once(b)), 250);
           return;
@@ -129,13 +208,21 @@ function installFakeWebTransport({ mode }) {
 
     async createBidirectionalStream() {
       const ws = this.ws;
+      let welcomed = false;
       const writable = new WritableStream({
         write(chunk) {
           // transport.js writes one whole frame per write.
           const kind = chunk[4];
           const payload = chunk.slice(5);
-          if (kind === 0) ws.send(new TextDecoder().decode(payload));
-          else if (kind === 1) ws.send(payload);
+          const send = () => {
+            if (ws.readyState !== 1) return;
+            if (kind === 0) ws.send(new TextDecoder().decode(payload));
+            else if (kind === 1) ws.send(payload);
+          };
+          // With the lane, the stream is slow (but for the hello): its datagrams get there first.
+          if (mode === 'datagrams' && welcomed) setTimeout(send, 200);
+          else send();
+          welcomed = true;
         },
       });
       return { readable: this.controlReadable, writable };

@@ -36,6 +36,11 @@ const CURSOR_POS = 0x03;
 const PONG = 0x04;
 const ACK = 0x10;
 const PING = 0x11;
+// The datagram lane (docs/protocol.md): the tests' fake WebTransport sends a datagram as a
+// binary WebSocket message with this byte in front.
+const HAVE = 0x12;
+const INPUT_RUN = 0x13;
+const DATAGRAM = 0xfd;
 const MOVE = 0x20;
 const BUTTON = 0x21;
 const WHEEL = 0x22;
@@ -67,6 +72,7 @@ export const DEFAULTS = {
   // tilt has no viewer limit; tests set one to check how the page handles an older server's busy.
   maxViewers: Infinity,
   resize: false, // like --resize: control sessions may send `resize`, which is recorded
+  datagrams: false, // turn the datagram lane on for a client whose hello asks for it
   maxMsgBytes: 262144,
   fps: 30,
   window: 4, // frames in flight before the stream waits for ACKs
@@ -426,7 +432,7 @@ export async function startMockServer(options = {}) {
     state.marker += n;
   }
 
-  function onInput(sess, type, b) {
+  function onInput(sess, type, b, datagram = false) {
     const accepted = sess === state.holder;
     const { w, h } = state.stream;
     const px = (v, size) => Math.round((v * (size - 1)) / 65535);
@@ -465,7 +471,7 @@ export async function startMockServer(options = {}) {
       default:
         rec = { type: 'RELEASE_ALL' };
     }
-    record(sess, { ...rec, accepted });
+    record(sess, { ...rec, accepted, ...(sess.lane ? { datagram } : {}) });
     if (!accepted) return;
     if (rec.px !== undefined) {
       state.cursorPos = [rec.px, rec.py];
@@ -475,7 +481,48 @@ export async function startMockServer(options = {}) {
     if (rec.type === 'TEXT') advanceMarker([...rec.text].length);
   }
 
-  function onBinary(sess, b) {
+  /** Counts an ordered message off the control stream; false if a datagram already brought it. */
+  function nextInOrder(sess) {
+    sess.seen++;
+    if (sess.seen <= sess.applied) return false;
+    sess.applied = sess.seen;
+    return true;
+  }
+
+  /** A datagram of the lane: an ACK, HAVE, or INPUT (the newest input messages, numbered). */
+  function onDatagram(sess, b) {
+    if (!sess.lane) {
+      violation(sess, 'datagram on a session without the lane');
+      return;
+    }
+    if (b[0] === ACK && b.length === SIZES[ACK]) {
+      onBinary(sess, b, true);
+    } else if (b[0] === HAVE && b.length === 13) {
+      record(sess, { type: 'HAVE', base: b.readUInt32LE(1), bits: b.readBigUInt64LE(5).toString(2) });
+    } else if (b[0] === INPUT_RUN && b.length >= 5) {
+      const first = b.readUInt32LE(1);
+      const used = [];
+      let n = first;
+      for (let at = 5; at < b.length; n++) {
+        const msg = b.subarray(at + 1, at + 1 + b[at]);
+        if (msg.length !== b[at] || !INPUT.has(msg[0])) {
+          violation(sess, 'INPUT datagram with a message that is not whole input');
+          return;
+        }
+        at += 1 + b[at];
+        if (n === sess.applied + 1) {
+          sess.applied = n;
+          used.push(n);
+          onBinary(sess, msg, true);
+        }
+      }
+      record(sess, { type: 'INPUT', first, count: n - first, used });
+    } else {
+      violation(sess, `unknown datagram 0x${(b[0] ?? 0).toString(16)}`);
+    }
+  }
+
+  function onBinary(sess, b, datagram = false) {
     const type = b[0];
     const size = SIZES[type];
     if (b.length === 0 || (size === undefined && type !== TEXT && type !== CLIPBOARD)) {
@@ -489,7 +536,12 @@ export async function startMockServer(options = {}) {
     if (type === ACK) {
       const seq = b.readUInt32LE(1);
       const decodeMs = b.readUInt16LE(5);
-      record(sess, { type: 'ACK', seq, decodeMs });
+      // With the lane an ACK comes twice, as a datagram and on the stream: the first counts.
+      if (sess.lane && seq <= sess.lastAck) {
+        record(sess, { type: 'ACK_AGAIN', seq, datagram });
+        return;
+      }
+      record(sess, { type: 'ACK', seq, decodeMs, ...(sess.lane ? { datagram } : {}) });
       onAck(sess, seq, decodeMs);
     } else if (type === PING) {
       const t = b.readUInt32LE(1);
@@ -501,7 +553,7 @@ export async function startMockServer(options = {}) {
         sendRaw(sess, pong);
       }
     } else if (INPUT.has(type)) {
-      onInput(sess, type, b);
+      if (datagram || nextInOrder(sess)) onInput(sess, type, b, datagram);
     }
   }
 
@@ -532,6 +584,10 @@ export async function startMockServer(options = {}) {
           sess.videoOn = true;
           sess.forceIdr = true;
         } else if (m.on !== true) violation(sess, 'video.on is not a boolean');
+        break;
+      case 'fps':
+        record(sess, { type: 'fps', fps: m.fps });
+        if (!Number.isInteger(m.fps)) violation(sess, 'fps.fps is not an integer');
         break;
       case 'resize':
         record(sess, { type: 'resize', w: m.w, h: m.h });
@@ -572,7 +628,7 @@ export async function startMockServer(options = {}) {
       sess.ws.close(1002, 'expected hello');
       return;
     }
-    record(sess, { type: 'hello', v: m.v, client: m.client, hasToken: typeof m.token === 'string' });
+    record(sess, { type: 'hello', v: m.v, client: m.client, hasToken: typeof m.token === 'string', fps: m.fps, datagrams: m.datagrams });
     if (m.v !== 1) {
       fail(sess, 'version', `server speaks v1, client sent v${m.v}`);
       return;
@@ -603,7 +659,18 @@ export async function startMockServer(options = {}) {
     sess.role = role;
     sess.welcomed = true;
     const st = state.stream;
-    sendJson(sess, { t: 'welcome', v: 1, session: sess.id, role, screen: { w: st.w, h: st.h }, server: SERVER, resize: opts.resize && role === 'control' });
+    sess.lane = opts.datagrams && m.datagrams === 1;
+    sendJson(sess, {
+      t: 'welcome',
+      v: 1,
+      session: sess.id,
+      role,
+      screen: { w: st.w, h: st.h },
+      server: SERVER,
+      resize: opts.resize && role === 'control',
+      fps: Math.min(Number.isInteger(m.fps) ? m.fps : 60, 120),
+      ...(sess.lane ? { datagrams: true } : {}),
+    });
     sendJson(sess, controlMsg(sess));
     sendRaw(sess, cursorShapeMsg());
     sendRaw(sess, cursorPosMsg());
@@ -640,6 +707,11 @@ export async function startMockServer(options = {}) {
       closeCode: null,
       videoOn: true,
       frozen: false,
+      lane: false,
+      // Ordered messages read from the stream (the hello is the first), and the number of
+      // the last one acted on: as the server counts them for INPUT datagrams.
+      seen: 1,
+      applied: 1,
       seq: 0,
       lastAck: 0,
       pos: -1,
@@ -669,8 +741,9 @@ export async function startMockServer(options = {}) {
         return;
       }
       if (!sess.welcomed) return;
-      if (isBinary) onBinary(sess, data);
-      else onText(sess, data.toString('utf8'));
+      if (isBinary && data[0] === DATAGRAM) onDatagram(sess, data.subarray(1));
+      else if (isBinary) onBinary(sess, data);
+      else if (nextInOrder(sess)) onText(sess, data.toString('utf8'));
     });
     ws.on('close', (code) => {
       // A cut session lives on, as on a server that has not noticed: drop() ends it.

@@ -30,9 +30,9 @@ No Node? `curl -fsSL https://raw.githubusercontent.com/cloudycotton/tilt/main/in
 
 ## Why tilt
 
-- **Fast.** 60 fps; a key press shows up in a few ms plus your network's round trip.
+- **Fast.** Up to 120 fps; a key press shows up in a few ms plus your network's round trip.
 - **Light.** One static binary. A few % of one CPU while you type, none while nobody watches.
-- **Smooth over the internet.** WebTransport over UDP: a lost packet never stalls your input or the next frame.
+- **Smooth over the internet.** WebTransport over UDP with error correction: across continents, a lost packet stalls neither your input nor the picture.
 - **Always current.** Updates itself whenever it starts.
 - **Chrome, Edge, Firefox, Safari 26.4+.** Mouse, keyboard, touch, paste, view-only links.
 

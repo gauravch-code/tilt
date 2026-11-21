@@ -17,7 +17,7 @@ use crate::control::ControlStatus;
 use crate::input::InputCmd;
 use crate::protocol::{self, ClientMsg, ClientText, ErrorCode, ScreenSize, ServerText};
 use crate::server::AppState;
-use crate::transport::{CloseFrame, Message, Sink, Stream};
+use crate::transport::{Arrived, CloseFrame, Message, Sink, Stream};
 use crate::worker::{self, Inbox};
 use crate::x11::clipboard::Copied;
 use crate::x11::cursor::CursorState;
@@ -203,20 +203,34 @@ fn close_frame(code: u16, reason: &'static str) -> CloseFrame {
 
 /// Runs one session until it closes.
 pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
-    let Some((sid, role)) = handshake(&mut sink, &mut stream, &state).await else {
+    let Some(Admitted {
+        sid,
+        role,
+        fps,
+        arrived,
+    }) = handshake(&mut sink, &mut stream, &state).await
+    else {
         // Delivers the refusal before the connection goes: over WebTransport, dropping the
         // sink would discard what the client has not acknowledged yet.
         let _ = tokio::time::timeout(Duration::from_secs(1), sink.close()).await;
         return;
     };
-    info!(session = sid, ?role, "connected");
+    info!(
+        session = sid,
+        ?role,
+        fps,
+        datagrams = arrived.is_some(),
+        "connected"
+    );
 
     let inbox = Inbox::new();
     let (out_tx, out_rx) = mpsc::channel(OUT_CAPACITY);
     let (reply_tx, reply_rx) = mpsc::channel(REPLY_CAPACITY);
-    state.hub.subscribe(sid, inbox.waker());
+    state
+        .hub
+        .subscribe(sid, inbox.waker(), Duration::from_secs(1) / fps);
     let control_rx = state.control.register(sid);
-    let worker = worker::spawn_worker(sid, Arc::clone(&state), Arc::clone(&inbox), out_tx);
+    let worker = worker::spawn_worker(sid, Arc::clone(&state), Arc::clone(&inbox), out_tx, fps);
 
     let (outcome, why) = match &worker {
         Ok(_) => {
@@ -228,6 +242,8 @@ pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
                 screen: ScreenSize { w, h },
                 server: protocol::SERVER_ID,
                 resize: state.cfg.resize.is_some() && role == Role::Control,
+                fps,
+                datagrams: arrived.is_some(),
             };
             let mut reader = Reader {
                 sid,
@@ -235,6 +251,10 @@ pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
                 state: &state,
                 inbox: &inbox,
                 replies: &reply_tx,
+                arrived: arrived.as_deref(),
+                // The hello was the control stream's first message.
+                seen: 1,
+                applied: 1,
                 malformed: 0,
                 held_keys: HashSet::new(),
                 held_buttons: 0,
@@ -242,6 +262,7 @@ pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
             };
             let writer = Writer {
                 sink: &mut sink,
+                arrived: arrived.as_deref(),
                 inbox: &inbox,
                 cursor_serial: None,
                 cursor_pos: None,
@@ -305,12 +326,22 @@ pub async fn run(mut sink: Sink, mut stream: Stream, state: Arc<AppState>) {
     info!(session = sid, "disconnected: {why}");
 }
 
+/// A session past its handshake.
+struct Admitted {
+    sid: SessionId,
+    role: Role,
+    /// The session's frame rate cap: `--max-fps`, or the viewer's display if that is slower.
+    fps: u32,
+    /// With the datagram lane: what the viewer reports as arrived.
+    arrived: Option<Arc<Arrived>>,
+}
+
+/// What a viewer that does not name its display's refresh rate gets, as before there was a
+/// choice.
+const DEFAULT_FPS: u32 = 60;
+
 /// Steps 1-5 of brief 4.1. On success the session is registered and counted.
-async fn handshake(
-    sink: &mut Sink,
-    stream: &mut Stream,
-    state: &AppState,
-) -> Option<(SessionId, Role)> {
+async fn handshake(sink: &mut Sink, stream: &mut Stream, state: &AppState) -> Option<Admitted> {
     let hello = match tokio::time::timeout(HELLO_TIMEOUT, first_message(stream)).await {
         Err(_) => {
             reject(sink, ErrorCode::HelloTimeout, "no hello within 5 s").await;
@@ -328,6 +359,8 @@ async fn handshake(
         token,
         client,
         recovery,
+        datagrams,
+        fps,
     }) = hello
     else {
         tokio::time::sleep(AUTH_FAIL_DELAY).await;
@@ -384,14 +417,28 @@ async fn handshake(
     if recovery {
         sink.enable_recovery();
     }
-    Some((sid, role))
+    let arrived = (datagrams >= 1)
+        .then(|| Arc::new(Arrived::default()))
+        .filter(|a| sink.enable_datagrams(Arc::clone(a)));
+    let fps = fps.unwrap_or(DEFAULT_FPS).clamp(1, state.cfg.max_fps);
+    Some(Admitted {
+        sid,
+        role,
+        fps,
+        arrived,
+    })
 }
 
 /// The first message; None when the peer goes away first.
 async fn first_message(stream: &mut Stream) -> Option<Message> {
-    match stream.next().await? {
-        Ok(Message::Close(_)) | Err(_) => None,
-        Ok(m) => Some(m),
+    loop {
+        match stream.next().await? {
+            Ok(Message::Close(_)) | Err(_) => return None,
+            // Nothing a datagram says counts before the hello; its input comes on the
+            // stream too.
+            Ok(Message::Datagram(_)) => {}
+            Ok(m) => return Some(m),
+        }
     }
 }
 
@@ -429,6 +476,14 @@ struct Reader<'a> {
     state: &'a AppState,
     inbox: &'a Inbox,
     replies: &'a mpsc::Sender<OutMsg>,
+    /// With the datagram lane: where the viewer's reports of arrived video go.
+    arrived: Option<&'a Arrived>,
+    /// Ordered messages read from the control stream so far: all but ACK and PING, the hello
+    /// included. A message's count is its number, which is how INPUT datagrams name theirs.
+    seen: u64,
+    /// The number of the last ordered message acted on, from the stream or from a datagram
+    /// that got here first. Each is acted on once, in order.
+    applied: u64,
     malformed: u32,
     /// What this session pressed through us, for the 3 s release.
     held_keys: HashSet<u32>,
@@ -469,8 +524,20 @@ impl Reader<'_> {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {
                     return (None, "closed by the client")
                 }
-                Some(Ok(Message::Binary(b))) => self.binary(&b, last_heard),
-                Some(Ok(Message::Text(t))) => self.text(t.as_str()),
+                Some(Ok(Message::Binary(b))) if protocol::unordered(&b) => {
+                    self.binary(&b, last_heard);
+                }
+                Some(Ok(Message::Binary(b))) => {
+                    if self.next_in_order() {
+                        self.binary(&b, last_heard);
+                    }
+                }
+                Some(Ok(Message::Text(t))) => {
+                    if self.next_in_order() {
+                        self.text(t.as_str());
+                    }
+                }
+                Some(Ok(Message::Datagram(d))) => self.datagram(&d, last_heard),
             }
             if self.malformed > MAX_MALFORMED {
                 return (
@@ -488,6 +555,45 @@ impl Reader<'_> {
         !self.held_keys.is_empty() || self.held_buttons != 0
     }
 
+    /// Counts an ordered message off the control stream; false when a datagram already
+    /// brought it.
+    fn next_in_order(&mut self) -> bool {
+        self.seen += 1;
+        let new = self.seen > self.applied;
+        if new {
+            self.applied = self.seen;
+        }
+        new
+    }
+
+    /// A datagram: an ACK as on the stream, which arrives first wins; HAVE, the VIDEO seqs
+    /// that arrived whole; or INPUT, the newest input messages with their numbers, of which
+    /// those that come next are acted on now rather than when the stream delivers them.
+    fn datagram(&mut self, d: &[u8], at: Instant) {
+        match d.first() {
+            Some(&protocol::MSG_ACK) => self.binary(d, at),
+            Some(&protocol::MSG_HAVE) => match (protocol::parse_have(d), self.arrived) {
+                (Some((base, bits)), Some(arrived)) => arrived.have(base, bits),
+                (Some(_), None) => {}
+                (None, _) => self.malformed(&"bad HAVE datagram"),
+            },
+            Some(&protocol::MSG_INPUT) => {
+                let Some(run) = protocol::InputRun::parse(d) else {
+                    return self.malformed(&"bad INPUT datagram");
+                };
+                for (number, msg) in run {
+                    // Numbers are compared in 32 bits, as sent; a session never gets near
+                    // sending that many.
+                    if number == (self.applied + 1) as u32 {
+                        self.applied += 1;
+                        self.binary(msg, at);
+                    }
+                }
+            }
+            _ => self.malformed(&"unknown datagram"),
+        }
+    }
+
     fn binary(&mut self, data: &[u8], at: Instant) {
         let msg = match ClientMsg::parse(data) {
             Ok(m) => m,
@@ -498,6 +604,8 @@ impl Reader<'_> {
             ClientMsg::Ack { seq, decode_ms } => {
                 if !self.inbox.ack(seq, decode_ms, at) {
                     self.malformed(&format_args!("ACK {seq} for a frame never sent"));
+                } else if let Some(arrived) = self.arrived {
+                    arrived.acked(seq);
                 }
                 return;
             }
@@ -614,6 +722,7 @@ impl Reader<'_> {
             ClientText::Control { take: true } => self.state.control.take(self.sid),
             ClientText::Control { take: false } => self.state.control.release(self.sid),
             ClientText::Idr => self.inbox.request_idr(),
+            ClientText::Fps { fps } => self.inbox.fps(fps),
             ClientText::Video { on } => self.inbox.video(on),
             ClientText::Hello { .. } => debug!(session = self.sid, "ignoring a repeated hello"),
         }
@@ -647,9 +756,27 @@ async fn until_set(rx: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Resolves when the viewer reports a gap in what arrived; never, without the lane.
+async fn gap(arrived: Option<&Arrived>) {
+    match arrived {
+        Some(arrived) => arrived.gap().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves at `at`; never, for None.
+async fn until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The writer: everything for the socket goes through here, one message at a time.
 struct Writer<'a> {
     sink: &'a mut Sink,
+    /// With the datagram lane: what the viewer reports as arrived.
+    arrived: Option<&'a Arrived>,
     /// Told when VIDEO is written, which flow control counts as progress.
     inbox: &'a Inbox,
     cursor_serial: Option<u32>,
@@ -698,6 +825,8 @@ impl Writer<'_> {
                     let status = *control.borrow_and_update();
                     self.send_control(status).await
                 }
+                () = until(self.sink.deadline()) => self.on_deadline().await,
+                () = gap(self.arrived) => self.on_deadline().await,
                 m = out.recv() => match m {
                     Some(m) => self.send_out(m).await,
                     None => {
@@ -727,6 +856,9 @@ impl Writer<'_> {
     /// Sends one worker message.
     async fn send_out(&mut self, msg: OutMsg) -> Result<(), ()> {
         let video = matches!(&msg, OutMsg::Binary(b) if b.first() == Some(&protocol::MSG_VIDEO));
+        if video {
+            self.sink.set_congested(self.inbox.congested());
+        }
         self.send(msg.into_message()).await?;
         if video {
             self.inbox.written();
@@ -755,6 +887,14 @@ impl Writer<'_> {
                 .await?;
         }
         Ok(())
+    }
+
+    /// The datagram lane's timer: second copies, and frames to send again on a stream.
+    async fn on_deadline(&mut self) -> Result<(), ()> {
+        match tokio::time::timeout(WRITE_TIMEOUT, self.sink.on_deadline()).await {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(()),
+        }
     }
 
     /// Feed and flush one message; a peer that does not drain it within 10 s is dropped.

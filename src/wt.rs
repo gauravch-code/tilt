@@ -14,11 +14,11 @@ use serde::Serialize;
 use tracing::{debug, info, warn};
 use wtransport::endpoint::endpoint_side::Server;
 use wtransport::endpoint::IncomingSession;
-use wtransport::quinn::congestion::BbrConfig;
 use wtransport::quinn::{IdleTimeout, TransportConfig};
 use wtransport::{Endpoint, Identity, ServerConfig, VarInt};
 
 use crate::clock::LogEvery;
+use crate::congestion::FlooredBbr;
 use crate::protocol;
 use crate::server::AppState;
 use crate::session;
@@ -42,6 +42,9 @@ const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// Unacknowledged bytes QUIC may have out. The client's ACKs already limit video in flight
 /// (src/flow.rs) to far less on any real link; this only bounds a misbehaving one.
 const SEND_WINDOW: u64 = 4 * 1024 * 1024;
+/// Datagrams QUIC may hold for sending, the oldest dropped beyond it: as much as the window.
+/// A frame whose datagrams were dropped is sent again on a stream (src/transport.rs).
+const DATAGRAM_BUFFER: usize = 4 * 1024 * 1024;
 /// Incoming control-stream messages are limited like WebSocket ones.
 const MAX_INCOMING_MSG: usize = 64 * 1024;
 
@@ -136,12 +139,14 @@ fn server_config(addr: SocketAddr) -> anyhow::Result<(ServerConfig, String)> {
         .collect();
 
     let mut transport = TransportConfig::default();
-    // BBR, not loss-based CUBIC: random loss on a long path does not halve the rate.
+    // BBR, not loss-based CUBIC: random loss on a long path does not halve the rate. With a
+    // floor under its window (src/congestion.rs), below which flow control decides.
     transport
-        .congestion_controller_factory(Arc::new(BbrConfig::default()))
+        .congestion_controller_factory(Arc::new(FlooredBbr::default()))
         .max_idle_timeout(Some(IdleTimeout::try_from(IDLE_TIMEOUT)?))
         .keep_alive_interval(Some(KEEP_ALIVE))
-        .send_window(SEND_WINDOW);
+        .send_window(SEND_WINDOW)
+        .datagram_send_buffer_size(DATAGRAM_BUFFER);
     let config = ServerConfig::builder()
         .with_bind_address(addr)
         .with_custom_transport(identity, transport)
@@ -210,8 +215,8 @@ async fn accept(incoming: IncomingSession, state: Arc<AppState>) {
     };
     debug!(%peer, "WebTransport session");
     session::run(
-        Sink::new(conn, send),
-        Stream::new(recv, MAX_INCOMING_MSG),
+        Sink::new(conn.clone(), send),
+        Stream::new(conn, recv, MAX_INCOMING_MSG),
         state,
     )
     .await;
@@ -367,6 +372,111 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), state.sessions.drained())
             .await
             .expect("the session ends");
+        server.abort();
+    }
+
+    /// The session's frame rate cap for a hello with these extra fields.
+    async fn welcome_for(advert: &Advert, extra: &str) -> serde_json::Value {
+        let conn = connect(advert, &stream_path(advert)).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap().await.unwrap();
+        let hello = format!(r#"{{"t":"hello","v":1{extra}}}"#);
+        send.write_all(&frame(KIND_TEXT, hello.as_bytes()))
+            .await
+            .unwrap();
+        read_json(&mut recv).await
+    }
+
+    #[tokio::test]
+    async fn the_frame_rate_cap_follows_the_viewers_display() {
+        let (_state, advert, server) = start(&["--no-auth"]).await;
+        // A viewer that names no display gets 60, as before there was a choice.
+        assert_eq!(welcome_for(&advert, "").await["fps"], 60);
+        assert_eq!(welcome_for(&advert, r#","fps":120"#).await["fps"], 120);
+        assert_eq!(welcome_for(&advert, r#","fps":90"#).await["fps"], 90);
+        assert_eq!(welcome_for(&advert, r#","fps":240"#).await["fps"], 120);
+        assert_eq!(welcome_for(&advert, r#","fps":0"#).await["fps"], 1);
+        server.abort();
+        let (_state, advert, server) = start(&["--no-auth", "--max-fps", "30"]).await;
+        assert_eq!(welcome_for(&advert, "").await["fps"], 30);
+        assert_eq!(welcome_for(&advert, r#","fps":120"#).await["fps"], 30);
+        server.abort();
+    }
+
+    // Two threads: the test waits on the input channel while the session runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_datagrams_are_acted_on_once_and_in_order() {
+        use crate::input::InputCmd;
+        let (state, input) = crate::server::test_state_with_input(&["--no-auth"]);
+        let endpoint = bind(&state, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let advert = state.wt_advert().clone().unwrap();
+        let server = tokio::spawn(run(endpoint, Arc::clone(&state)));
+        let conn = connect(&advert, &stream_path(&advert)).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap().await.unwrap();
+        // Message 1 on the control stream.
+        send.write_all(&frame(KIND_TEXT, br#"{"t":"hello","v":1,"datagrams":1}"#))
+            .await
+            .unwrap();
+        let welcome = read_json(&mut recv).await;
+        assert_eq!(welcome["datagrams"], true);
+        // Message 2.
+        send.write_all(&frame(KIND_TEXT, br#"{"t":"control","take":true}"#))
+            .await
+            .unwrap();
+        loop {
+            let m = read_json(&mut recv).await;
+            if m["t"] == "control" && m["you"] == true {
+                break;
+            }
+        }
+        let key = |down: u8, keysym: u8| vec![protocol::MSG_KEY, down, keysym, 0, 0, 0];
+        let run = |first: u32, msgs: &[Vec<u8>]| {
+            let mut d = vec![protocol::MSG_INPUT];
+            d.extend_from_slice(&first.to_le_bytes());
+            for m in msgs {
+                d.push(m.len() as u8);
+                d.extend_from_slice(m);
+            }
+            d
+        };
+        // The next key the input thread is sent (taking control tells it other things).
+        let next = |what: &str| loop {
+            let cmd = input
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("no input for {what}"));
+            if let InputCmd::Key { keysym, down, .. } = cmd {
+                return (keysym, down);
+            }
+        };
+        let no_key = || !input.try_iter().any(|c| matches!(c, InputCmd::Key { .. }));
+        // Messages 3 and 4 come as a datagram before the stream has them.
+        conn.send_datagram(run(3, &[key(1, 0x61), key(0, 0x61)]))
+            .unwrap();
+        assert_eq!(next("the datagram"), (0x61, true));
+        assert_eq!(next("the datagram"), (0x61, false));
+        // An ACK and a PING on the stream are not numbered; then the stream's own copies of
+        // 3 and 4, which change nothing, and 5, which only the stream brings.
+        send.write_all(&frame(KIND_BINARY, &[protocol::MSG_PING, 1, 0, 0, 0]))
+            .await
+            .unwrap();
+        for msg in [key(1, 0x61), key(0, 0x61), key(1, 0x62)] {
+            send.write_all(&frame(KIND_BINARY, &msg)).await.unwrap();
+        }
+        assert_eq!(next("message 5"), (0x62, true));
+        // A datagram repeating 5 with 6 behind it: only 6 is new. One that starts past the
+        // next number waits for the stream, so 8 is not acted on before 7.
+        conn.send_datagram(run(5, &[key(1, 0x62), key(0, 0x62)]))
+            .unwrap();
+        assert_eq!(next("message 6"), (0x62, false));
+        conn.send_datagram(run(8, &[key(0, 0x63)])).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(no_key(), "8 before 7");
+        for msg in [key(0, 0x62), key(1, 0x63), key(0, 0x63)] {
+            send.write_all(&frame(KIND_BINARY, &msg)).await.unwrap();
+        }
+        assert_eq!(next("message 7"), (0x63, true));
+        assert_eq!(next("message 8"), (0x63, false));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(no_key(), "nothing twice");
         server.abort();
     }
 

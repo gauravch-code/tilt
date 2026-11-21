@@ -6,7 +6,8 @@ WebView or a test probe. The server's implementation is `src/protocol.rs` and `s
 **In short:** fetch `transport` next to the page, open the WebTransport session it names, send
 `{"t":"hello","v":1,"token":"…"}` on a bidirectional stream, then receive H.264 frames (one per
 unidirectional stream; decode them with WebCodecs) and send ACKs, a PING every second, and mouse
-and key events back. The rest of this page is the exact contract.
+and key events back. The rest of this page is the exact contract. A client that wants the stream
+to stay smooth across a long, lossy path also speaks [the datagram lane](#the-datagram-lane).
 
 All binary integers are little-endian. Every message is either:
 - binary: the first byte is the message type;
@@ -54,7 +55,10 @@ All binary integers are little-endian. Every message is either:
    The `token` field may be omitted only in no-auth mode. Tokens never go in a URL; the web
    client reads them from the page's URL fragment (`#token=`).
    A client supporting the recovery format below adds `"recovery":true`. Without it the server
-   sends only ordinary VIDEO streams. Older servers ignore this optional field.
+   sends only ordinary VIDEO streams. A client that speaks the datagram lane (below) adds
+   `"datagrams":1`, and one that knows its display's refresh rate adds `"fps":N`: the session's
+   frame rate cap is then the lower of N and `--max-fps`. Without `fps` it is 60, or `--max-fps`
+   if that is lower. Older servers ignore these optional fields.
 6. If `v != 1`, the server replies `{"t":"error","code":"version","msg":...}` and closes.
 7. If the token is wrong, the server sleeps 500 ms, then sends `{"t":"error","code":"auth"}` and
    closes.
@@ -63,7 +67,9 @@ All binary integers are little-endian. Every message is either:
    sends `{"t":"error","code":"not_ready"}` and closes. (Servers before 0.4 had a viewer limit
    and answered `{"t":"error","code":"busy"}`, closing with 4002; clients should retry then.)
 9. On success the server sends, in this order:
-   - `{"t":"welcome","v":1,"session":"s7","role":"control"|"view","screen":{"w":W,"h":H},"server":"tilt/0.1.0","resize":bool}`
+   - `{"t":"welcome","v":1,"session":"s7","role":"control"|"view","screen":{"w":W,"h":H},"server":"tilt/0.1.0","resize":bool,"fps":N}`,
+     with `"datagrams":true` when the datagram lane is on for the session. `fps` is the
+     session's frame rate cap (servers before 0.7 do not send it)
    - `{"t":"control","you":bool,"held":bool,"holder":"s3"}` (see section 4)
    - CURSOR_SHAPE and CURSOR_POS, if known
    - then video, starting with a KEY frame.
@@ -152,7 +158,79 @@ be mixed in one session. The receiver bounds incomplete recovery groups to 32 an
 reconstructed VIDEO to 128 KiB; malformed shards or exceeding the group limit reconnects.
 The web client's `tilt:stats.client` includes cumulative `recoveryFrames` and `recoveredFrames`;
 the latter counts reconstruction using parity, not necessarily a packet loss (shards can reorder).
-Existing video kbps statistics exclude recovery overhead.
+Existing video kbps statistics exclude recovery overhead. A session with the datagram lane gets
+no recovery streams: the lane does their job for frames of every size.
+
+### The datagram lane
+
+A stream resends a lost packet about one round trip later, and frames decode in order, so
+across 250 ms of round trip every lost packet freezes the picture for a quarter of a second,
+and a lost packet of input holds back all the input behind it as long. The lane carries the
+same messages as WebTransport datagrams, which nothing resends, with enough repetition that a
+lost packet seldom matters. Everything on it is also, or in the end, on a stream: a client may
+ignore the lane, and a datagram that does not arrive costs time, never data.
+
+The lane is on for a session when its `hello` had `"datagrams":1`, the connection takes
+datagrams, and so the `welcome` has `"datagrams":true`. A client sends no datagrams before
+that `welcome`.
+
+**VIDEO as datagrams.** The server may send a VIDEO message as datagrams instead of a stream:
+
+`u8 0x06 | u32 seq | u32 length | u8 k | u8 index | shard` (LE)
+
+`length` is the VIDEO message's length including its 18-byte header, `k` the number of data
+shards, and every shard of a frame is `ceil(length / k)` bytes. Shards `0..k` are consecutive
+pieces of the message, the last zero-padded; shards from `k` up are parity. Any `k` distinct
+shards rebuild the message; then check its type and seq against the envelope and deliver it in
+seq order like one that came on a stream. Drop a shard that makes no sense, a shard of a frame
+already complete, and frames that never complete: nothing on the lane ends the session.
+
+The parity is Reed-Solomon over GF(2^8) with polynomial 0x11d. Parity shard `k + j` is, byte
+by byte, the sum over the data shards `i` of `w(j, i) · data_i`, with `w(j, i) = x / (x + i)`
+for `x = 255 − j` (field division, `+` being XOR). `w(j, 0)` is 1, so a frame of one shard has
+copies for parity. To rebuild, take the data shards that arrived out of as many parity shards
+as data shards are missing, and solve what is left for the missing ones (`fecRebuild` in
+web/transport.js, `rebuild` in src/fec.rs).
+
+The server sends one parity shard per four data shards (rounded up), and more while a frame
+would otherwise fail to arrive whole more than once in ten thousand at the loss rate it plans
+for (the path's measured one and half as much again, 0.5% at least): a frame of four shards
+gets two at 0.5% and three at 3%. At most 192 data shards (about 220 KiB; larger frames go on
+a stream), and parity of at most half the data (48 shards; three for the smallest frames). It
+does so for every frame, on paths with a minimum round trip of 60 ms or more. All frames go
+back to streams while the link cannot carry the stream (frames wait for credit with the
+bitrate at its floor), and for 5 to 60 seconds when more than a tenth of the frames had to be
+sent again: such loss comes from a full queue, which parity does not mend. The copies of a
+one-shard frame follow it 4 ms apart.
+
+**HAVE** (client to server, datagram only): `u8 0x12 | u32 base | u64 bits` (LE). Every VIDEO
+seq before `base` has arrived in full, by either route, and so has seq `base + 1 + i` for each
+set bit `i` (bit 0 the lowest); `base` itself has not. Send one whenever a frame completes, and
+the last one again 25 ms later. A frame sent as datagrams is sent again, as an ordinary VIDEO
+stream and as datagrams, once a HAVE reports a seq two or more past it whole while it is not;
+and as a stream alone when the server has not heard of it this way, nor in an ACK, two round
+trips and 50 ms after sending it. So a client that ignores FEC datagrams, or cannot send HAVE,
+still gets every frame, late.
+
+**ACK** may also be sent as a datagram, in its 7 bytes of section 3, as well as on the control
+stream: ACKs are cumulative, so whichever arrives first counts and the other changes nothing.
+An ACK held up on the stream behind a lost packet would read as a queue on the path.
+
+**INPUT** (client to server, datagram only): `u8 0x13 | u32 first | { u8 len | message }…`
+(LE). Each `message` is an input message of section 3 (MOVE to CLIPBOARD, at most 255 bytes)
+that the client also sends on the control stream, and `first` is the number of the first one,
+the rest counting up from it. Messages are numbered by their place on the control stream,
+counting every message there except ACK and PING, the `hello` being 1; JSON messages count
+but only travel on the stream. The server acts on each numbered message once, in order, from
+whichever of the datagram and the stream brings it first: a datagram's messages are used from
+the one numbered one past the last acted on, and a datagram that starts later than that is
+dropped. Put the newest messages in each datagram (the web client sends up to 16 of the last
+500 ms, and repeats the last datagram 15 and 45 ms later), so that what a lost datagram
+carried, the next carries again.
+
+The web client's `tilt:stats.client` has `datagrams` (the lane is on), cumulative `fecFrames`
+and `fecRepaired` (frames that arrived whole as datagrams, and those of them rebuilt with
+parity, which is not always a loss: a parity shard can overtake a data shard) and `displayHz`.
 
 ## 3. Client to server, binary
 
@@ -183,8 +261,9 @@ Coordinate mapping, done on the server against the current screen size W×H:
 Input from a session that does not hold control is silently dropped, as is input from a
 view-role session. ACK and PING are always processed.
 
-Flow control depends on ACKs: the server only has a few frames in flight per session (3 to 32,
-scaled with the round trip) and encodes nothing more until they are acknowledged. A client that
+Flow control depends on ACKs: the server only has a few frames in flight per session (3 to 240,
+two round trips' worth at the session's frame rate) and encodes nothing more until they are
+acknowledged. A client that
 stops acking stops receiving video. When nothing has moved for 5 s, neither an ACK arrived nor
 VIDEO was written, the server forgets the frames in flight and goes on; after each such reset
 with no ACK since, the next wait doubles, up to 20 s. It sends no KEY frame for this (streams
@@ -206,6 +285,10 @@ Client to server:
   `welcome` says `"resize":true` (control role, server started with `--resize`) and nobody else
   holds control; otherwise ignored, or `forbidden` for a session that may not send it. The web
   client sends it after its welcome and whenever its window has kept a new size for 300 ms.
+- `{"t":"fps","fps":N}`: the viewer's display refreshes N times a second, when that is not what
+  `hello` said (the web client measures it from animation frames, and its first estimate, taken
+  while the page loads, can be low). The session's frame rate cap becomes the lower of N and
+  `--max-fps`, and a KEY frame follows a change. Only for a server whose `welcome` has `fps`.
 - `{"t":"video","on":false|true}`: pause or resume video, for example when the page is hidden.
   Pausing forgets the frames in flight (ACKs for them are still accepted, and teach the server
   nothing). Resume forces an IDR.
@@ -224,7 +307,7 @@ Server to client:
 - `{"t":"stats","fps":f,"kbps":f,"bitrate_kbps":n,"rtt_ms":f,"min_rtt_ms":f,"queue_ms":f,"enc_ms":f,"inflight":n,"skipped":n,"viewers":n,"gov_fps":n,"qp":f,"patches":n}`:
   sent every 1 s while video is on. `fps`, `kbps` and `enc_ms` cover the last second; `skipped`
   counts captures this session never encoded, over the whole session. `gov_fps` is the frame
-  rate cap in force (`--max-fps`); `qp` is the mean quantizer of the last second's frames, 0
+  rate cap in force (`--max-fps`, or the viewer's display rate if lower); `qp` is the mean quantizer of the last second's frames, 0
   when there were none. `patches` is how many of the last second's `fps` were patches; `enc_ms`
   and `qp` cover the H.264 frames only.
 - `{"t":"clipboard","text":"…"}`: an application on the display copied this text (the CLIPBOARD

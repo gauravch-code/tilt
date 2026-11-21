@@ -36,7 +36,9 @@ const STALL_AFTER: Duration = Duration::from_secs(5);
 /// Each stall reset with no ACK since doubles the next wait, up to 2^this times STALL_AFTER.
 const STALL_DOUBLINGS_MAX: u32 = 2;
 const MIN_FRAME_CAP: u32 = 3;
-const MAX_FRAME_CAP: u32 = 32;
+/// Two one-second round trips of frames at 120 fps. It was 32, which at 120 fps covered one
+/// round trip of 250 ms, so that between continents every lost packet stopped the encoder.
+const MAX_FRAME_CAP: u32 = 240;
 const MIN_BYTE_BUDGET: f64 = 64.0 * 1024.0;
 
 const EVAL_EVERY: Duration = Duration::from_millis(500);
@@ -48,6 +50,16 @@ const INCREASE_HOLD_OFF: Duration = Duration::from_millis(1500);
 const USAGE_WINDOW: Duration = Duration::from_secs(1);
 /// A drain probe ends anyway after this long, so a lost ACK cannot pin the session at one frame.
 const PROBE_MAX: Duration = Duration::from_secs(1);
+/// Out of credit for this much of a second with the bitrate at its floor, the link cannot
+/// carry the stream at any bitrate the encoder can reach (see `congested`). It then counts
+/// as congested for STARVED_OFF, and after that as not for STARVED_TRIAL whatever happens:
+/// with parity off, a lossy link stalls the stream, and stalls starve it of credit just the
+/// same, so only a spell with parity on can tell the two apart. Each trial that ends starved
+/// doubles the wait for the next, up to STARVED_OFF_MAX: a trial costs a starved link.
+const STARVED_MS: u32 = 250;
+const STARVED_OFF: Duration = Duration::from_secs(6);
+const STARVED_OFF_MAX: Duration = Duration::from_secs(60);
+const STARVED_TRIAL: Duration = Duration::from_secs(3);
 
 /// One access unit awaiting its ack, with the delivery counters as they were when it was sent.
 struct InFlight {
@@ -151,6 +163,11 @@ pub struct FlowControl {
     sent: VecDeque<(Instant, usize)>,
     last_eval: Option<Instant>,
     last_congestion: Option<Instant>,
+    /// The link was found starved: congested until then, and on trial for STARVED_TRIAL
+    /// after it.
+    starved_until: Option<Instant>,
+    /// How long it counts as congested the next time.
+    starved_off: Duration,
     increase_after: Option<Instant>,
     /// While Some, a drain probe is running (see `on_ack`): send only into an empty pipe.
     probe_since: Option<Instant>,
@@ -184,10 +201,17 @@ impl FlowControl {
             sent: VecDeque::new(),
             last_eval: None,
             last_congestion: None,
+            starved_until: None,
+            starved_off: STARVED_OFF,
             increase_after: None,
             probe_since: None,
             probes: 0,
         }
+    }
+
+    /// The session's frame rate cap changed: credit is counted in frames of that rate.
+    pub fn set_fps(&mut self, fps: u32) {
+        self.cfg.fps = fps;
     }
 
     /// Records access unit `seq`, `bytes` long, as in flight.
@@ -326,6 +350,19 @@ impl FlowControl {
             self.blocked.pop_front();
         }
         self.blocked_ms_last_s = self.blocked_within(now, USAGE_WINDOW).as_millis() as u32;
+        let starved = self.blocked_ms_last_s >= STARVED_MS && self.bitrate_bps <= self.cfg.min_bps;
+        match self.starved_until {
+            // Congested, or on trial: no verdict before the trial is over.
+            Some(until) if now < until + STARVED_TRIAL => {}
+            _ if starved => {
+                self.starved_until = Some(now + self.starved_off);
+                self.starved_off = (self.starved_off * 2).min(STARVED_OFF_MAX);
+            }
+            _ => {
+                self.starved_until = None;
+                self.starved_off = STARVED_OFF;
+            }
+        }
 
         if self
             .last_eval
@@ -361,6 +398,16 @@ impl FlowControl {
             }
         }
         (self.bitrate_bps != before).then_some(self.bitrate_bps)
+    }
+
+    /// Whether the link cannot carry the stream: with the bitrate at its floor, frames still
+    /// waited for credit for a quarter of a second. Parity for large frames (src/fec.rs)
+    /// would then take from the video what the link lacks, and what a full link drops is no
+    /// random loss that parity mends. A bitrate that was merely lowered does not count: the
+    /// controller probes upwards into a queue every few seconds on any link slower than
+    /// `max_bps`, and makes room for the parity as for anything else that slows the link.
+    pub fn congested(&self, now: Instant) -> bool {
+        self.starved_until.is_some_and(|t| now < t)
     }
 
     /// True when a frame is in flight and for 5 s nothing has moved: no ACK of any kind came
@@ -585,7 +632,14 @@ mod tests {
             .map(|&ms| frame_cap_at(ms * MS))
             .collect();
         // Two RTTs' worth of frames, plus one: room for a resent packet's delay.
-        assert_eq!(caps, [3, 5, 8, 14, 26, 32, 32]);
+        assert_eq!(caps, [3, 5, 8, 14, 26, 51, 122]);
+        // At 120 fps the same round trips hold twice the frames.
+        let fast = FlowConfig { fps: 120, ..cfg() };
+        let t0 = Instant::now();
+        let mut f = FlowControl::new(fast, t0);
+        f.on_sent(1, 100, t0);
+        f.on_ack(1, 0, t0 + 250 * MS);
+        assert_eq!(f.frame_cap(t0 + 250 * MS), 62);
         // Before any sample the 50 ms default applies.
         let t0 = Instant::now();
         assert_eq!(FlowControl::new(cfg(), t0).frame_cap(t0), 8);
@@ -942,6 +996,16 @@ mod tests {
                 p.max_inflight_bytes
             );
         }
+        // Frames that cannot shrink into the link: it is congested, but for the three-second
+        // trials that tell a starved link from a lossy one, each further apart than the last.
+        assert_eq!(sim.flow.starved_off, STARVED_OFF_MAX);
+        let mut congested = 0;
+        for _ in 0..60 {
+            sim.run(1, |_| 100_000);
+            let now = sim.t0 + sim.step as u32 * MS;
+            congested += u32::from(sim.flow.congested(now));
+        }
+        assert!((54..=58).contains(&congested), "{congested} s of 60");
         for p in &phases {
             // No ratchet from one min-RTT window to the next.
             assert!(
@@ -978,12 +1042,20 @@ mod tests {
             roomy.max_queue
         );
 
+        let now = sim.t0 + sim.step as u32 * MS;
+        assert!(!sim.flow.congested(now), "a roomy link is not congested");
+
         // Capacity drops to 4 Mbit/s: back off below it within a few seconds, queue bounded.
         sim.set_rate(500_000.0);
         let squeezed_start = sim.run(4, sized);
         squeezed_start.print("bitrate 0.5 MB/s 15-19 s");
         let squeezed = sim.run(10, sized);
         squeezed.print("bitrate 0.5 MB/s 19-29 s");
+        let now = sim.t0 + sim.step as u32 * MS;
+        assert!(
+            !sim.flow.congested(now),
+            "nor one the bitrate has adapted to"
+        );
         assert!(
             squeezed_start.max_queue < Duration::from_millis(500),
             "queue {:?}",

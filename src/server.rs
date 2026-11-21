@@ -216,12 +216,23 @@ pub async fn serve(
 /// An AppState for tests: `args` after `tilt`, no X server, input going nowhere.
 #[cfg(test)]
 pub fn test_state(args: &[&str]) -> Arc<AppState> {
+    test_state_with_input(args).0
+}
+
+/// Like [`test_state`], with what the sessions send to the input thread.
+#[cfg(test)]
+pub fn test_state_with_input(
+    args: &[&str],
+) -> (
+    Arc<AppState>,
+    crossbeam_channel::Receiver<crate::input::InputCmd>,
+) {
     let cfg = Arc::new(
         Config::try_load_from(std::iter::once("tilt").chain(args.iter().copied())).unwrap(),
     );
     let (hub, _capture_wake) = FrameHub::new();
-    let (input, _input_rx) = InputHandle::detached();
-    AppState::new(AppParts {
+    let (input, input_rx) = InputHandle::detached();
+    let state = AppState::new(AppParts {
         tokens: TokenSource::from_config(&cfg),
         hub,
         input,
@@ -230,7 +241,8 @@ pub fn test_state(args: &[&str]) -> Arc<AppState> {
         sessions: Sessions::new(),
         cpus: 4,
         cfg,
-    })
+    });
+    (state, input_rx)
 }
 
 #[cfg(test)]
